@@ -8,12 +8,12 @@
         "type": "tabs",
         "children": [
           {
-            "id": "c348ce4935c420a8",
+            "id": "4cda998c7ef628ba",
             "type": "leaf",
             "state": {
               "type": "markdown",
               "state": {
-                "file": "Baseline System.md",
+                "file": "notes/Baseline System.md",
                 "mode": "source",
                 "source": false
               },
@@ -186,19 +186,21 @@
       "obsidian-excalidraw-plugin:New drawing": false
     }
   },
-  "active": "c348ce4935c420a8",
+  "active": "4cda998c7ef628ba",
   "lastOpenFiles": [
-    "camera/camera_feed.go~",
+    "ml/ml.go~",
     "server/server.go~",
-    "bin/camera",
-    "bin/server",
-    "bin",
-    "server/server.go",
-    "camera/camera_feed.go",
-    "camera/camera_feed_1.go",
-    "camera_feed_1.go",
-    "server",
-    "camera",
-    "Baseline System.md"
+    "types/types.go~",
+    "Excalidraw/Drawing 2026-09-22 11.02.55.excalidraw.md",
+    "notes/Baseline System.md",
+    "notes/Excalidraw/Drawing 2026-09-18 16.35.33.excalidraw.md",
+    "__debug_bin3626780890",
+    "__debug_bin81636563",
+    "__debug_bin1226949087",
+    "notes/Excalidraw/Pasted Image 20260920171649_843.png",
+    "Excalidraw",
+    "camera/camera_feed.go~",
+    "bin/ml",
+    "go.mod~"
   ]
 }
