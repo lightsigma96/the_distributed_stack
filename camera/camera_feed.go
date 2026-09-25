@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/binary"
 	"log"
 	"net"
@@ -33,13 +32,27 @@ func main() {
 
 		copy(p.Data[:2], "hi")
 
-		buf := new(bytes.Buffer)
-		binary.Write(buf, binary.BigEndian, p)
+		var send_event []byte
 
-		_, err := server_conn.Write(buf.Bytes())
+		id_slice := make([]byte, 8)
+		binary.BigEndian.PutUint64(id_slice, p.CameraID)
+		send_event = append(send_event, id_slice...)
 
+		send_event = binary.BigEndian.AppendUint32(
+			send_event,
+			uint32(len(p.CameraAddress)),
+		)
+		send_event = append(send_event, p.CameraAddress...)
+
+		send_event = binary.BigEndian.AppendUint32(
+			send_event,
+			uint32(len(p.Data)),
+		)
+		send_event = append(send_event, p.Data[:]...)
+
+		_, err := server_conn.Write(send_event)
 		if err != nil {
-			log.Println("write error")
+			log.Println("write error:", err)
 		}
 		counter++
 		time.Sleep(time.Second / 60)

@@ -204,10 +204,11 @@
   "active": "820ec762c1805dd9",
   "lastOpenFiles": [
     "ml/ml.go~",
+    "server/server.go~",
     "create_topic.sh~",
+    "camera/camera_feed.go~",
     "create_topic.sh",
     "start_kafka.sh~",
-    "server/server.go~",
     "types/types.go~",
     "g.sh",
     "f.sh~",
@@ -217,7 +218,6 @@
     "notes/Excalidraw/Drawing 2026-09-18 16.35.33.excalidraw.md",
     "start_kafka.sh",
     "notes/Excalidraw/Pasted Image 20260920171649_843.png",
-    "Excalidraw/Drawing 2026-09-22 11.02.55.excalidraw.md",
-    "__debug_bin3626780890"
+    "Excalidraw/Drawing 2026-09-22 11.02.55.excalidraw.md"
   ]
 }
