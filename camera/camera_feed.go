@@ -11,7 +11,7 @@ import (
 )
 
 func main() {
-	server_conn, err := net.Dial("udp4", ":8080")
+	server_conn, err := net.Dial("udp4", "127.0.0.1:8080")
 
 	if err != nil {
 		log.Fatalln("COULD NOT START SERVER")

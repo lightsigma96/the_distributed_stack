@@ -22,7 +22,6 @@ func produce_event(conn *kafka.Conn, topic string, partition int, event types.Pa
 
 	var send_event []byte
 
-	// replace this wire protcol later with protobuf
 	id_slice := make([]byte, 8)
 
 	binary.BigEndian.PutUint64(id_slice, event.CameraID)
@@ -47,7 +46,7 @@ func produce_event(conn *kafka.Conn, topic string, partition int, event types.Pa
 func main() {
 
 	current_partition := 0
-	const topic = "camera_event"
+	const topic = "camera-topic"
 
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{
 		Port: 8080,
@@ -71,19 +70,18 @@ func main() {
 	for {
 		buf := make([]byte, 1024)
 
-		_, _, err := conn.ReadFromUDP(buf)
-
-		var p types.Packet
-		binary.Read(
-			bytes.NewReader(buf),
-			binary.BigEndian,
-			&p,
-		)
-
+		n, _, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			log.Println("error receiving packet:", err)
 			continue
 		}
+
+		var p types.Packet
+		binary.Read(
+			bytes.NewReader(buf[:n]),
+			binary.BigEndian,
+			&p,
+		)
 
 		if current_partition < types.MAX_PARTITION {
 			produce_event(kafka_conn, topic, current_partition, p)
