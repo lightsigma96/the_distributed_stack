@@ -4,11 +4,23 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"github.com/lightsigma96/the_distributed_stack/types"
-	"github.com/segmentio/kafka-go"
 	"log"
 	"net"
+	"strings"
+
+	"github.com/lightsigma96/the_distributed_stack/types"
+	"github.com/segmentio/kafka-go"
 )
+
+// cluster node
+type ClusterNode struct {
+	nodeip string
+}
+
+// cluster node lines
+type CluserLinks struct {
+	Nodes []ClusterNode
+}
 
 func produce_event(conn *kafka.Conn, event types.Packet) {
 	var send_event []byte
@@ -40,8 +52,62 @@ func produce_event(conn *kafka.Conn, event types.Packet) {
 	}
 }
 
+/*
+Request format is:
+
+some_cli_unique_identifier (not decided yet)\r\n
+1st node \r\n
+2nd node \r\n
+...
+\r\n\r\n
+*/
+func try_filling_nodes(req []byte, links *CluserLinks) bool {
+	lines := strings.Split(string(req), "\r\n")
+
+	identifier := lines[0]
+
+	// check if correct identifier
+	if !identifier {
+		return false
+	}
+
+	for _, line := range lines[1:] {
+		if line == "" {
+			return false
+		}
+		var node ClusterNode
+		node.nodeip = line
+		links.Nodes = append(links.Nodes, node)
+	}
+	return true
+}
+
+func wait_for_clireq(links *CluserLinks) {
+	for {
+		log.Println("\nWAITING FOR CLI TOOL TO SPECIFY CLUSTER\n")
+		waiting_for_cli, err := net.Listen("tcp4", "localhost:8000")
+
+		if err != nil {
+			fmt.Println("Unable to listen for cli tool")
+		}
+
+		cli_req, err := waiting_for_cli.Accept()
+
+		var cli_msg []byte
+		n, err := cli_req.Read(cli_msg) // loop for complete message
+
+		if try_filling_nodes(cli_msg[:n], links) {
+			log.Println("\nOK FORMED A CLUSTER\n")
+			return
+		}
+		log.Println("\nINVAILD CLI REQUEST\n")
+	}
+}
+
 func main() {
 	const topic = "camera-topic"
+
+	var links CluserLinks
 
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{
 		Port: 8080,
@@ -82,6 +148,9 @@ func main() {
 	current_partition := 0
 
 	for {
+
+		wait_for_clireq(&links)
+
 		buf := make([]byte, 1024)
 
 		n, _, err := conn.ReadFromUDP(buf)
