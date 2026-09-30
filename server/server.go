@@ -4,23 +4,120 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"github.com/lightsigma96/the_distributed_stack/types"
+	"github.com/segmentio/kafka-go"
 	"log"
 	"net"
 	"strings"
-
-	"github.com/lightsigma96/the_distributed_stack/types"
-	"github.com/segmentio/kafka-go"
+	"time"
 )
 
 // cluster node
 type ClusterNode struct {
-	nodeip string
+	out_bound_connections []net.Conn
+	in_bound_connections  []net.Conn
+	listening_conn        net.Listener
 }
 
-// cluster node lines
-type CluserLinks struct {
-	Nodes []ClusterNode
+// represents all the states needed by ClusterCron
+type ClusterCronStates struct {
+	camera_conn       net.UDPConn
+	kafka_conns       []kafka.Conn
+	current_partition int
 }
+
+/*
+	Cluster initialization functions
+*/
+
+/*
+Fills Node List, if successful returns true else false
+
+Request format is:
+
+some_cli_unique_identifier (not decided yet)\r\n
+1st node \r\n
+2nd node \r\n
+this : this node \r\n
+...
+\r\n\r\n
+*/
+func parse_cli_req(req []byte, node *ClusterNode, this_node_addr *string) bool {
+	lines := strings.Split(string(req), "\r\n")
+
+	identifier := lines[0]
+
+	// TODO(Me): check if correct identifier
+	if identifier == "" {
+		return false
+	}
+
+	for _, line := range lines[1:] {
+		if line == "" {
+			break
+		}
+
+		// TODO(AI Suggest): this_node_addr = assign this node addr
+
+		// TODO(Me): return false when line is wrong
+
+		conn, err := net.Dial("tcp4", line)
+
+		if err != nil {
+			log.Println("Error Adding Outbound Connectino")
+		}
+
+		node.out_bound_connections = append(node.out_bound_connections, &conn)
+	}
+	return true
+}
+
+/* Waits for correct cli request, adds outbound connections and send appropiate message back to cli tool */
+func wait_for_clireq(node *ClusterNode) string {
+	log.Println("\nWAITING FOR CLI TOOL TO SPECIFY CLUSTER")
+	waiting_for_cli, err := net.Listen("tcp4", "localhost:8000")
+
+	if err != nil {
+		fmt.Println("Unable to listen for cli tool")
+	}
+
+	for {
+		cli_req, err := waiting_for_cli.Accept()
+
+		cli_msg := make([]byte, 1024)
+		n, err := cli_req.Read(cli_msg) // TODO(AI): loop for complete message
+
+		cli_req.Close()
+		var response_to_cli string
+		var this_node_addr string
+
+		if parse_cli_req(cli_msg[:n], node, &this_node_addr) {
+			response_to_cli = "\nOK FORMED A CLUSTER"
+
+			_, err := cli_req.Write([]byte(response_to_cli)) // TODO(AI): loop for complete message
+			if err != nil {
+				log.Println("Error sending response to cli")
+			}
+
+			log.Println(response_to_cli)
+			waiting_for_cli.Close()
+			return this_node_addr
+		}
+
+		response_to_cli = "\nINVAILD CLI REQUEST"
+		_, err = cli_req.Write([]byte(response_to_cli)) // TODO(AI): loop for complete message
+		if err != nil {
+			log.Println("\nError sending response to cli")
+		}
+		log.Println(response_to_cli)
+	}
+}
+
+/*
+	Cron functions
+*/
+
+/* pushses a event into kafka partition */
 
 func produce_event(conn *kafka.Conn, event types.Packet) {
 	var send_event []byte
@@ -52,71 +149,116 @@ func produce_event(conn *kafka.Conn, event types.Packet) {
 	}
 }
 
-/*
-Request format is:
+/* Takes feed from cctv and push events into kafka
+ */
+func ingestion(camera_conn *net.UDPConn, kafka_conns []*kafka.Conn, current_partition int) {
+	buf := make([]byte, 1024)
 
-some_cli_unique_identifier (not decided yet)\r\n
-1st node \r\n
-2nd node \r\n
-...
-\r\n\r\n
-*/
-func try_filling_nodes(req []byte, links *CluserLinks) bool {
-	lines := strings.Split(string(req), "\r\n")
-
-	identifier := lines[0]
-
-	// check if correct identifier
-	if !identifier {
-		return false
+	n, _, err := camera_conn.ReadFromUDP(buf)
+	if err != nil {
+		log.Println("error receiving packet:", err)
+		return
 	}
 
-	for _, line := range lines[1:] {
-		if line == "" {
-			return false
-		}
-		var node ClusterNode
-		node.nodeip = line
-		links.Nodes = append(links.Nodes, node)
+	raw := buf[:n]
+
+	if len(raw) < 12 {
+		log.Println("packet too small")
+		return
 	}
-	return true
+
+	var p types.Packet
+
+	p.CameraID = binary.BigEndian.Uint64(raw[0:8])
+
+	addressLen := int(binary.BigEndian.Uint32(raw[8:12]))
+
+	addressStart := 12
+	addressEnd := addressStart + addressLen
+
+	if addressEnd+4 > len(raw) {
+		log.Println("invalid address length")
+		return
+	}
+
+	p.CameraAddress = string(raw[addressStart:addressEnd])
+
+	dataLen := int(binary.BigEndian.Uint32(
+		raw[addressEnd : addressEnd+4],
+	))
+
+	dataStart := addressEnd + 4
+	dataEnd := dataStart + dataLen
+
+	if dataEnd > len(raw) || dataLen > len(p.Data) {
+		log.Println("invalid data length")
+		return
+	}
+
+	copy(p.Data[:], raw[dataStart:dataEnd])
+
+	fmt.Printf("Partition: %d\n", current_partition)
+
+	produce_event(
+		kafka_conns[current_partition],
+		p,
+	)
+
+	current_partition++
+
+	if current_partition >= types.MAX_PARTITION {
+		current_partition = 0
+	}
 }
 
-func wait_for_clireq(links *CluserLinks) {
+func (n *ClusterNode) pingAll() {
+	for nodes := range n.others_links {
+
+	}
+}
+
+/* Gets called 10 times in 1s. This is the main loop for this server */
+func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 	for {
-		log.Println("\nWAITING FOR CLI TOOL TO SPECIFY CLUSTER\n")
-		waiting_for_cli, err := net.Listen("tcp4", "localhost:8000")
+		// accept incoming connections
+		node.listening_conn.Accept()
 
-		if err != nil {
-			fmt.Println("Unable to listen for cli tool")
-		}
+		ingestion(states.camera_conn, states.kafka_conns, states.current_partition)
 
-		cli_req, err := waiting_for_cli.Accept()
-
-		var cli_msg []byte
-		n, err := cli_req.Read(cli_msg) // loop for complete message
-
-		if try_filling_nodes(cli_msg[:n], links) {
-			log.Println("\nOK FORMED A CLUSTER\n")
-			return
-		}
-		log.Println("\nINVAILD CLI REQUEST\n")
+		ping_all()
+		time.Sleep(time.Millisecond * 100)
 	}
 }
 
 func main() {
-	const topic = "camera-topic"
 
-	var links CluserLinks
+	var node ClusterNode
 
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{
-		Port: 8080,
-	})
+	// Form outbound connection with other servers
+	listening_addr := wait_for_clireq(&node)
+
+	// add inbound connection
+	other_server_conn, err := net.Listen("tcp4", listening_addr)
+	node.listening_conn = &other_server_conn
+
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer conn.Close()
 
+	// Form connection with cameras
+	const topic = "camera-topic"
+
+	cam_conn, err := net.ListenUDP("udp4", &net.UDPAddr{
+		Port: 8080,
+	})
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	defer cam_conn.Close()
+
+	// Form connection with kafka
 	kafka_conns := make([]*kafka.Conn, types.MAX_PARTITION)
 
 	for partition := 0; partition < types.MAX_PARTITION; partition++ {
@@ -147,66 +289,5 @@ func main() {
 
 	current_partition := 0
 
-	for {
-
-		wait_for_clireq(&links)
-
-		buf := make([]byte, 1024)
-
-		n, _, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			log.Println("error receiving packet:", err)
-			continue
-		}
-
-		raw := buf[:n]
-
-		if len(raw) < 12 {
-			log.Println("packet too small")
-			continue
-		}
-
-		var p types.Packet
-
-		p.CameraID = binary.BigEndian.Uint64(raw[0:8])
-
-		addressLen := int(binary.BigEndian.Uint32(raw[8:12]))
-
-		addressStart := 12
-		addressEnd := addressStart + addressLen
-
-		if addressEnd+4 > len(raw) {
-			log.Println("invalid address length")
-			continue
-		}
-
-		p.CameraAddress = string(raw[addressStart:addressEnd])
-
-		dataLen := int(binary.BigEndian.Uint32(
-			raw[addressEnd : addressEnd+4],
-		))
-
-		dataStart := addressEnd + 4
-		dataEnd := dataStart + dataLen
-
-		if dataEnd > len(raw) || dataLen > len(p.Data) {
-			log.Println("invalid data length")
-			continue
-		}
-
-		copy(p.Data[:], raw[dataStart:dataEnd])
-
-		fmt.Printf("Partition: %d\n", current_partition)
-
-		produce_event(
-			kafka_conns[current_partition],
-			p,
-		)
-
-		current_partition++
-
-		if current_partition >= types.MAX_PARTITION {
-			current_partition = 0
-		}
-	}
+	clusterCron()
 }
