@@ -6,10 +6,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lightsigma96/the_distributed_stack/types"
@@ -70,7 +70,8 @@ func parse_cli_req(req []byte, node *ClusterNode) bool {
 		conn, err := net.Dial("tcp4", line)
 
 		if err != nil {
-			log.Println("Error Adding Outbound Connectino")
+			log.Println("Error Adding Outbound Connection:", err)
+			continue
 		}
 
 		node.out_bound_connections = append(node.out_bound_connections, &conn)
@@ -89,31 +90,36 @@ func wait_for_clireq(node *ClusterNode) {
 
 	for {
 		cli_req, err := waiting_for_cli.Accept()
+		if err != nil {
+			log.Println("Error accepting CLI connection:", err)
+			continue
+		}
 
 		cli_msg := make([]byte, 1024)
 		n, err := cli_req.Read(cli_msg) // TODO(AI): loop for complete message
-
-		cli_req.Close()
-		var response_to_cli string
+		if err != nil {
+			log.Println("Error reading CLI request:", err)
+			cli_req.Close()
+			continue
+		}
 
 		if parse_cli_req(cli_msg[:n], node) {
-			response_to_cli = "\nOK FORMED A CLUSTER"
-
-			_, err := cli_req.Write([]byte(response_to_cli)) // TODO(AI): loop for complete message
-			if err != nil {
-				log.Println("Error sending response to cli")
+			response_to_cli := "\nOK FORMED A CLUSTER"
+			if _, err := cli_req.Write([]byte(response_to_cli)); err != nil {
+				log.Println("Error sending response to cli:", err)
 			}
-
 			log.Println(response_to_cli)
+			cli_req.Close()
 			waiting_for_cli.Close()
+			return
 		}
 
-		response_to_cli = "\nINVAILD CLI REQUEST"
-		_, err = cli_req.Write([]byte(response_to_cli)) // TODO(AI): loop for complete message
-		if err != nil {
-			log.Println("\nError sending response to cli")
+		response_to_cli := "\nINVAILD CLI REQUEST"
+		if _, err := cli_req.Write([]byte(response_to_cli)); err != nil {
+			log.Println("Error sending response to cli:", err)
 		}
 		log.Println(response_to_cli)
+		cli_req.Close()
 	}
 }
 
@@ -221,44 +227,70 @@ on-wire format of PING : "addr_of_this_server\nPING\n" & same for PONG
 returns addr of node which did not respond pong
 */
 func (n *ClusterNode) pingAll() []string {
+	var ws sync.WaitGroup
 	var fault_pongs []string
+	var fp_mut sync.Mutex
+
+	// make routine, wait for first response (have a deadline), now check correctness, only now get the lock once and add if fault.
 
 	for i := 0; i < len(n.out_bound_connections); i++ {
-		fmt.Fprintf(*n.out_bound_connections[i], "%s\n%s\n", (*n.out_bound_connections[i]).LocalAddr().String(), "PING")
+		conn := *n.out_bound_connections[i]
+		ws.Go(func() {
+			if _, err := fmt.Fprintf(conn, "%s\nPING\n", conn.LocalAddr().String()); err != nil {
+				log.Println("Error sending PING:", err)
+				return
+			}
 
-		err := (*n.out_bound_connections[i]).SetReadDeadline(time.Now().Add(time.Millisecond * 20))
-		if err != nil {
-			log.Println("Couldn't set deadline on listening socket")
-		}
+			if err := conn.SetReadDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+				log.Println("Couldn't set read deadline:", err)
+				return
+			}
 
-		msg_reader := bufio.NewScanner((*n.out_bound_connections[i]))
+			scanner := bufio.NewScanner(conn)
 
-		pong_addr := make([]byte, 0, 1024)
-		for msg_reader.Scan() {
-			// TODO (AI): handle msg too big
-			pong_addr = msg_reader.Bytes()
-		}
+			if !scanner.Scan() {
+				if err := scanner.Err(); err != nil {
+					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+						log.Println("PONG timeout")
+					} else {
+						log.Println("Error receiving PONG:", err)
+					}
+					fp_mut.Lock()
+					fault_pongs = append(fault_pongs, conn.RemoteAddr().String())
+					fp_mut.Unlock()
+				}
+				return
+			}
+			pongAddr := scanner.Text()
 
-		pong := make([]byte, 0, 1024)
-		for msg_reader.Scan() {
-			// TODO (AI): handle msg too big
-			pong = msg_reader.Bytes()
-		}
+			if !scanner.Scan() {
+				if err := scanner.Err(); err != nil {
+					log.Println("Error receiving PONG:", err)
+					fp_mut.Lock()
+					fault_pongs = append(fault_pongs, conn.RemoteAddr().String())
+					fp_mut.Unlock()
+				}
+				return
+			}
+			pong := scanner.Text()
 
-		scn_err := msg_reader.Err()
-		if !errors.Is(scn_err, io.EOF) {
-			log.Println("Some error in recieving PONG")
-		}
+			if pong != "PONG" {
+				fmt.Printf("Incorrect PONG received from %s\n", pongAddr)
+				fp_mut.Lock()
+				fault_pongs = append(fault_pongs, pongAddr)
+				fp_mut.Unlock()
+			}
 
-		if string(pong) != "PONG" {
-			fmt.Printf("Incorrect PONG recieved from %s", string(pong_addr))
-			fault_pongs = append(fault_pongs, string(pong_addr))
-		}
+			if err := conn.SetReadDeadline(time.Time{}); err != nil {
+				log.Println("Couldn't clear read deadline:", err)
+			}
+		})
 	}
+	ws.Wait()
 	return fault_pongs
 }
 
-/* Gets called 10 times in 1s that means each iteration runs for 100ms. This is the main loop for this server */
+/* Gets called 10 times in 1s that means each iteration runs for 100ms. This is the main loop for this server (add go routine to ping to make it concurrent) */
 func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 	for {
 		// accept incoming connections (10ms deadline)
@@ -271,14 +303,15 @@ func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 		new_inbound_client, err := node.listening_conn.Accept()
 
 		if err != nil {
-			var timeout_err net.Error
-			if errors.As(err, timeout_err) && timeout_err.Timeout() {
+			var timeoutErr net.Error
+			if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
 				log.Println("No new connection to accept")
+			} else {
+				log.Println("Error in accepting new inbound client:", err)
 			}
-			log.Println("Error in accepting new inbound client")
+		} else {
+			node.in_bound_connections = append(node.in_bound_connections, &new_inbound_client)
 		}
-
-		node.in_bound_connections = append(node.in_bound_connections, &new_inbound_client)
 
 		// send new events (TODO (me): how much time does this func takes in ms)
 		ingestion(states.camera_conn, states.kafka_conns, states.current_partition)
