@@ -1,28 +1,34 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
-	"github.com/lightsigma96/the_distributed_stack/types"
-	"github.com/segmentio/kafka-go"
+	"io"
 	"log"
 	"net"
 	"strings"
 	"time"
+
+	"github.com/lightsigma96/the_distributed_stack/types"
+	"github.com/segmentio/kafka-go"
 )
 
 // cluster node
 type ClusterNode struct {
-	out_bound_connections []net.Conn
-	in_bound_connections  []net.Conn
-	listening_conn        net.Listener
+	out_bound_connections []*net.Conn
+
+	in_bound_connections []*net.Conn
+
+	listening_conn *net.TCPListener
 }
 
 // represents all the states needed by ClusterCron
 type ClusterCronStates struct {
-	camera_conn       net.UDPConn
-	kafka_conns       []kafka.Conn
+	camera_conn       *net.UDPConn
+	kafka_conns       []*kafka.Conn
 	current_partition int
 }
 
@@ -31,7 +37,7 @@ type ClusterCronStates struct {
 */
 
 /*
-Fills Node List, if successful returns true else false
+Fills out_bound_connections and set listening_conn for this server address
 
 Request format is:
 
@@ -42,7 +48,7 @@ this : this node \r\n
 ...
 \r\n\r\n
 */
-func parse_cli_req(req []byte, node *ClusterNode, this_node_addr *string) bool {
+func parse_cli_req(req []byte, node *ClusterNode) bool {
 	lines := strings.Split(string(req), "\r\n")
 
 	identifier := lines[0]
@@ -72,8 +78,8 @@ func parse_cli_req(req []byte, node *ClusterNode, this_node_addr *string) bool {
 	return true
 }
 
-/* Waits for correct cli request, adds outbound connections and send appropiate message back to cli tool */
-func wait_for_clireq(node *ClusterNode) string {
+/* Waits for correct cli request, sends appropiate message back to cli tool */
+func wait_for_clireq(node *ClusterNode) {
 	log.Println("\nWAITING FOR CLI TOOL TO SPECIFY CLUSTER")
 	waiting_for_cli, err := net.Listen("tcp4", "localhost:8000")
 
@@ -89,9 +95,8 @@ func wait_for_clireq(node *ClusterNode) string {
 
 		cli_req.Close()
 		var response_to_cli string
-		var this_node_addr string
 
-		if parse_cli_req(cli_msg[:n], node, &this_node_addr) {
+		if parse_cli_req(cli_msg[:n], node) {
 			response_to_cli = "\nOK FORMED A CLUSTER"
 
 			_, err := cli_req.Write([]byte(response_to_cli)) // TODO(AI): loop for complete message
@@ -101,7 +106,6 @@ func wait_for_clireq(node *ClusterNode) string {
 
 			log.Println(response_to_cli)
 			waiting_for_cli.Close()
-			return this_node_addr
 		}
 
 		response_to_cli = "\nINVAILD CLI REQUEST"
@@ -149,8 +153,9 @@ func produce_event(conn *kafka.Conn, event types.Packet) {
 	}
 }
 
-/* Takes feed from cctv and push events into kafka
- */
+/*
+Takes feed from cctv and push events into kafka
+*/
 func ingestion(camera_conn *net.UDPConn, kafka_conns []*kafka.Conn, current_partition int) {
 	buf := make([]byte, 1024)
 
@@ -211,21 +216,79 @@ func ingestion(camera_conn *net.UDPConn, kafka_conns []*kafka.Conn, current_part
 	}
 }
 
-func (n *ClusterNode) pingAll() {
-	for nodes := range n.others_links {
+/*
+on-wire format of PING : "addr_of_this_server\nPING\n" & same for PONG
+returns addr of node which did not respond pong
+*/
+func (n *ClusterNode) pingAll() []string {
+	var fault_pongs []string
 
+	for i := 0; i < len(n.out_bound_connections); i++ {
+		fmt.Fprintf(*n.out_bound_connections[i], "%s\n%s\n", (*n.out_bound_connections[i]).LocalAddr().String(), "PING")
+
+		err := (*n.out_bound_connections[i]).SetReadDeadline(time.Now().Add(time.Millisecond * 20))
+		if err != nil {
+			log.Println("Couldn't set deadline on listening socket")
+		}
+
+		msg_reader := bufio.NewScanner((*n.out_bound_connections[i]))
+
+		pong_addr := make([]byte, 0, 1024)
+		for msg_reader.Scan() {
+			// TODO (AI): handle msg too big
+			pong_addr = msg_reader.Bytes()
+		}
+
+		pong := make([]byte, 0, 1024)
+		for msg_reader.Scan() {
+			// TODO (AI): handle msg too big
+			pong = msg_reader.Bytes()
+		}
+
+		scn_err := msg_reader.Err()
+		if !errors.Is(scn_err, io.EOF) {
+			log.Println("Some error in recieving PONG")
+		}
+
+		if string(pong) != "PONG" {
+			fmt.Printf("Incorrect PONG recieved from %s", string(pong_addr))
+			fault_pongs = append(fault_pongs, string(pong_addr))
+		}
 	}
+	return fault_pongs
 }
 
-/* Gets called 10 times in 1s. This is the main loop for this server */
+/* Gets called 10 times in 1s that means each iteration runs for 100ms. This is the main loop for this server */
 func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 	for {
-		// accept incoming connections
-		node.listening_conn.Accept()
+		// accept incoming connections (10ms deadline)
+		err := node.listening_conn.SetDeadline(time.Now().Add(time.Millisecond * 10))
 
+		if err != nil {
+			log.Println("Couldn't set deadline on listening socket")
+		}
+
+		new_inbound_client, err := node.listening_conn.Accept()
+
+		if err != nil {
+			var timeout_err net.Error
+			if errors.As(err, timeout_err) && timeout_err.Timeout() {
+				log.Println("No new connection to accept")
+			}
+			log.Println("Error in accepting new inbound client")
+		}
+
+		node.in_bound_connections = append(node.in_bound_connections, &new_inbound_client)
+
+		// send new events (TODO (me): how much time does this func takes in ms)
 		ingestion(states.camera_conn, states.kafka_conns, states.current_partition)
 
-		ping_all()
+		// check on other servers
+		for _, fn := range node.pingAll() {
+			// TODO: set in pfail or fail
+			log.Printf("This node did not send a PONG %s", fn)
+		}
+
 		time.Sleep(time.Millisecond * 100)
 	}
 }
@@ -233,17 +296,10 @@ func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 func main() {
 
 	var node ClusterNode
+	var cluster_state ClusterCronStates
 
-	// Form outbound connection with other servers
-	listening_addr := wait_for_clireq(&node)
-
-	// add inbound connection
-	other_server_conn, err := net.Listen("tcp4", listening_addr)
-	node.listening_conn = &other_server_conn
-
-	if err != nil {
-		log.Fatal(err)
-	}
+	// become a part of cluster
+	wait_for_clireq(&node)
 
 	// Form connection with cameras
 	const topic = "camera-topic"
@@ -287,7 +343,9 @@ func main() {
 		}
 	}()
 
-	current_partition := 0
+	cluster_state.camera_conn = cam_conn
+	cluster_state.kafka_conns = kafka_conns
+	cluster_state.current_partition = 0
 
-	clusterCron()
+	clusterCron(&node, &cluster_state)
 }
