@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -18,11 +19,14 @@ import (
 
 // cluster node
 type ClusterNode struct {
+	// connection to other servers
 	out_bound_connections []*net.Conn
 
+	// connection made by other servers
 	in_bound_connections []*net.Conn
 
-	listening_conn *net.TCPListener
+	// listening_conn for cluster
+	listening_conn net.Listener
 }
 
 // represents all the states needed by ClusterCron
@@ -37,26 +41,23 @@ type ClusterCronStates struct {
 */
 
 /*
-Fills out_bound_connections and set listening_conn for this server address
+Fills out_bound_connections
 
 Request format is:
 
-some_cli_unique_identifier (not decided yet)\r\n
 1st node \r\n
 2nd node \r\n
-this : this node \r\n
 ...
 \r\n\r\n
 */
 func parse_cli_req(req []byte, node *ClusterNode) bool {
 	lines := strings.Split(string(req), "\r\n")
 
-	identifier := lines[0]
-
+	//identifier := lines[0]
 	// TODO(Me): check if correct identifier
-	if identifier == "" {
-		return false
-	}
+	//if identifier == "" {
+	//	return false
+	//}
 
 	for _, line := range lines[1:] {
 		if line == "" {
@@ -82,14 +83,9 @@ func parse_cli_req(req []byte, node *ClusterNode) bool {
 /* Waits for correct cli request, sends appropiate message back to cli tool */
 func wait_for_clireq(node *ClusterNode) {
 	log.Println("\nWAITING FOR CLI TOOL TO SPECIFY CLUSTER")
-	waiting_for_cli, err := net.Listen("tcp4", "localhost:8000")
-
-	if err != nil {
-		fmt.Println("Unable to listen for cli tool")
-	}
 
 	for {
-		cli_req, err := waiting_for_cli.Accept()
+		cli_req, err := node.listening_conn.Accept()
 		if err != nil {
 			log.Println("Error accepting CLI connection:", err)
 			continue
@@ -110,7 +106,6 @@ func wait_for_clireq(node *ClusterNode) {
 			}
 			log.Println(response_to_cli)
 			cli_req.Close()
-			waiting_for_cli.Close()
 			return
 		}
 
@@ -290,17 +285,18 @@ func (n *ClusterNode) pingAll() []string {
 	return fault_pongs
 }
 
-/* Gets called 10 times in 1s that means each iteration runs for 100ms. This is the main loop for this server (add go routine to ping to make it concurrent) */
+/* Sleeps for 100ms after every iteration. This is the main loop for this server (add go routine to ping to make it concurrent) */
 func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 	for {
 		// accept incoming connections (10ms deadline)
-		err := node.listening_conn.SetDeadline(time.Now().Add(time.Millisecond * 10))
-
-		if err != nil {
-			log.Println("Couldn't set deadline on listening socket")
-		}
 
 		new_inbound_client, err := node.listening_conn.Accept()
+
+		if err != nil {
+			log.Println("Couldn't Accept")
+		}
+
+		err = new_inbound_client.SetDeadline(time.Now().Add(time.Millisecond * 10))
 
 		if err != nil {
 			var timeoutErr net.Error
@@ -328,8 +324,18 @@ func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 
 func main() {
 
+	listening_addr := flag.String("server_address", "nil", "Specify address of server to start on")
+
+	listen_conn, err := net.Listen("tcp4", *listening_addr)
+
+	if err != nil {
+		fmt.Println("Unable to listen for cli tool")
+	}
+
 	var node ClusterNode
 	var cluster_state ClusterCronStates
+
+	node.listening_conn = listen_conn
 
 	// become a part of cluster
 	wait_for_clireq(&node)

@@ -2,11 +2,10 @@ package main
 
 import (
 	"encoding/binary"
+	"github.com/lightsigma96/the_distributed_stack/types"
 	"log"
 	"net"
 	"time"
-
-	"github.com/lightsigma96/the_distributed_stack/types"
 )
 
 func main() {
