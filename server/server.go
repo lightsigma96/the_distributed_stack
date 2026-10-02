@@ -26,7 +26,7 @@ type ClusterNode struct {
 	in_bound_connections []*net.Conn
 
 	// listening_conn for cluster
-	listening_conn net.Listener
+	listening_conn *net.TCPListener
 }
 
 // represents all the states needed by ClusterCron
@@ -157,7 +157,7 @@ func produce_event(conn *kafka.Conn, event types.Packet) {
 /*
 Takes feed from cctv and push events into kafka
 */
-func ingestion(camera_conn *net.UDPConn, kafka_conns []*kafka.Conn, current_partition int) {
+func ingestion(camera_conn *net.UDPConn, kafka_conns []*kafka.Conn, current_partition *int) {
 	buf := make([]byte, 1024)
 
 	n, _, err := camera_conn.ReadFromUDP(buf)
@@ -203,17 +203,17 @@ func ingestion(camera_conn *net.UDPConn, kafka_conns []*kafka.Conn, current_part
 
 	copy(p.Data[:], raw[dataStart:dataEnd])
 
-	fmt.Printf("Partition: %d\n", current_partition)
+	fmt.Printf("Partition: %d\n", *current_partition)
 
 	produce_event(
-		kafka_conns[current_partition],
+		kafka_conns[*current_partition],
 		p,
 	)
 
-	current_partition++
+	*current_partition++
 
-	if current_partition >= types.MAX_PARTITION {
-		current_partition = 0
+	if *current_partition >= types.MAX_PARTITION {
+		*current_partition = 0
 	}
 }
 
@@ -289,28 +289,26 @@ func (n *ClusterNode) pingAll() []string {
 func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 	for {
 		// accept incoming connections (10ms deadline)
-
-		new_inbound_client, err := node.listening_conn.Accept()
-
+		err := node.listening_conn.SetDeadline(time.Now().Add(time.Millisecond * 10))
 		if err != nil {
-			log.Println("Couldn't Accept")
-		}
-
-		err = new_inbound_client.SetDeadline(time.Now().Add(time.Millisecond * 10))
-
-		if err != nil {
-			var timeoutErr net.Error
-			if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
-				log.Println("No new connection to accept")
-			} else {
-				log.Println("Error in accepting new inbound client:", err)
-			}
+			log.Println("Couldn't set deadline on listening socket:", err)
 		} else {
-			node.in_bound_connections = append(node.in_bound_connections, &new_inbound_client)
+			new_inbound_client, err := node.listening_conn.Accept()
+
+			if err != nil {
+				var timeoutErr net.Error
+				if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+					log.Println("No new connection to accept")
+				} else {
+					log.Println("Error in accepting new inbound client:", err)
+				}
+			} else {
+				node.in_bound_connections = append(node.in_bound_connections, &new_inbound_client)
+			}
 		}
 
 		// send new events (TODO (me): how much time does this func takes in ms)
-		ingestion(states.camera_conn, states.kafka_conns, states.current_partition)
+		ingestion(states.camera_conn, states.kafka_conns, &states.current_partition)
 
 		// check on other servers
 		for _, fn := range node.pingAll() {
@@ -326,10 +324,14 @@ func main() {
 
 	listening_addr := flag.String("server_address", "nil", "Specify address of server to start on")
 
-	listen_conn, err := net.Listen("tcp4", *listening_addr)
-
+	addr, err := net.ResolveTCPAddr("tcp4", *listening_addr)
 	if err != nil {
-		fmt.Println("Unable to listen for cli tool")
+		log.Fatal("Unable to resolve server address:", err)
+	}
+
+	listen_conn, err := net.ListenTCP("tcp4", addr)
+	if err != nil {
+		log.Fatal("Unable to listen for cli tool:", err)
 	}
 
 	var node ClusterNode
