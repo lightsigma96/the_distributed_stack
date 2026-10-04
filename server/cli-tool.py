@@ -20,6 +20,7 @@ def send_request(servers_list : List[str]):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((TCP_IP, TCP_PORT))
             s.sendall(message.encode("utf-8"))
+        print(message)
 
 def main():
     parser = argparse.ArgumentParser(

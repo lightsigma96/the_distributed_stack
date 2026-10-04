@@ -18,13 +18,10 @@ import (
 
 // cluster node
 type ClusterNode struct {
-	// connection to other servers
-	out_bound_connections []*net.Conn
+	// connections
+	connections []*net.Conn
 
-	// connection made by other servers
-	in_bound_connections []*net.Conn
-
-	// listening_conn for cluster
+	// listener for cluster
 	listening_conn *net.TCPListener
 }
 
@@ -66,8 +63,8 @@ func parse_cli_req(req []byte, node *ClusterNode) bool {
 			continue
 		}
 
-		node.out_bound_connections = append(node.out_bound_connections, &conn)
-		node.in_bound_connections = append(node.in_bound_connections, &conn)
+		// in bound should have listen and outbound dial
+		node.connections = append(node.connections, &conn)
 	}
 	return true
 }
@@ -223,8 +220,8 @@ func (n *ClusterNode) pingAll() []string {
 
 	// make routine, wait for first response (have a deadline), now check correctness, only now get the lock once and add if fault.
 
-	for i := 0; i < len(n.out_bound_connections); i++ {
-		conn := *n.out_bound_connections[i]
+	for i := 0; i < len(n.connections); i++ {
+		conn := *n.connections[i]
 		ws.Go(func() {
 			if _, err := fmt.Fprintf(conn, "PING\n"); err != nil {
 				log.Println("Error sending PING:", err)
@@ -240,21 +237,6 @@ func (n *ClusterNode) pingAll() []string {
 
 			if !scanner.Scan() {
 				if err := scanner.Err(); err != nil {
-					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-						log.Println("PONG timeout")
-					} else {
-						log.Println("Error receiving PONG:", err)
-					}
-					fp_mut.Lock()
-					fault_pongs = append(fault_pongs, conn.RemoteAddr().String())
-					fp_mut.Unlock()
-				}
-				return
-			}
-			pongAddr := scanner.Text()
-
-			if !scanner.Scan() {
-				if err := scanner.Err(); err != nil {
 					log.Println("Error receiving PONG:", err)
 					fp_mut.Lock()
 					fault_pongs = append(fault_pongs, conn.RemoteAddr().String())
@@ -264,10 +246,10 @@ func (n *ClusterNode) pingAll() []string {
 			}
 			pong := scanner.Text()
 
-			if pong != "PONG\n" {
-				fmt.Printf("Incorrect PONG received from %s\n", pongAddr)
+			if pong != "PONG" {
+				fmt.Printf("Incorrect PONG received from %s\n", conn.RemoteAddr().String())
 				fp_mut.Lock()
-				fault_pongs = append(fault_pongs, pongAddr)
+				fault_pongs = append(fault_pongs, conn.RemoteAddr().String())
 				fp_mut.Unlock()
 			}
 
@@ -283,7 +265,8 @@ func (n *ClusterNode) pingAll() []string {
 /* Sleeps for 100ms after every iteration. This is the main loop for this server (add go routine to ping to make it concurrent) */
 func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 	for {
-		log.Printf("Number of connections in out_bound : %d and in_bound : %d", len(node.out_bound_connections), len(node.in_bound_connections)) // both should have 1 for 2 servers
+		//log.Printf("Number of connections in out_bound : %d and in_bound : %d", len(node.connections), len(node.in_bound_connections)) // both should have 1 for 2 servers
+
 		// accept incoming connections (10ms deadline)
 		err := node.listening_conn.SetDeadline(time.Now().Add(time.Millisecond * 10))
 		if err != nil {
@@ -299,30 +282,31 @@ func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 					log.Println("Error in accepting new inbound client:", err)
 				}
 			} else {
-				node.in_bound_connections = append(node.in_bound_connections, &new_inbound_client)
+				node.connections = append(node.connections, &new_inbound_client)
 			}
 		}
 
 		// send new events (TODO (me): how much time does this func takes in ms)
 		ingestion(states.camera_conn, states.kafka_conns, &states.current_partition)
 
-		// check on other servers
+		// PING
 		for _, fn := range node.pingAll() {
 			// TODO: set in pfail or fail
 			log.Printf("Did not recieve a PONG from %s", fn)
 		}
 
-		// first handle incoming connections and then send PINGs (i.e. reply before asking)
-		for _, conn := range node.in_bound_connections {
+		// PONG
+		for _, conn := range node.connections {
+			(*conn).SetReadDeadline(time.Now().Add(time.Millisecond * 60))
 			scanner := bufio.NewScanner(*conn)
-			if !scanner.Scan() {
+			if scanner.Scan() {
 				if serr := scanner.Err(); serr != nil {
 					log.Printf("Error reading from connection: %s", (*conn).RemoteAddr())
 					continue
 				}
 
-				if scanner.Text() == "PING\n" {
-					if _, err := fmt.Fprintf(*conn, "PING\n"); err != nil {
+				if scanner.Text() == "PING" {
+					if _, err := fmt.Fprintf(*conn, "PONG\n"); err != nil {
 						log.Println("Error sending PONG: ", err)
 					}
 				}
