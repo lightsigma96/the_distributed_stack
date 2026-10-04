@@ -200,21 +200,20 @@
   },
   "active": "4cda998c7ef628ba",
   "lastOpenFiles": [
-    "server/server.go~",
     "server/cli-tool.py~",
+    "server/4913",
+    "server/server.go~",
+    "notes/Excalidraw/Drawing 2026-09-18 16.35.33.excalidraw.md",
+    "camera/camera_feed.go~",
+    "camera/4913",
     "server/cli-tool.py",
     "server/cli-tool.go~",
-    "notes/Excalidraw/Drawing 2026-09-18 16.35.33.excalidraw.md",
-    "server/4913",
     "notes/Baseline System.md",
     "notes/Excalidraw/Pasted Image 20260920171649_843.png",
     "notes/Scaling with Kafka.md",
     "ml/ml.go~",
     "create_topic.sh~",
-    "camera/camera_feed.go~",
     "create_topic.sh",
-    "start_kafka.sh~",
-    "types/types.go~",
     "Excalidraw/Drawing 2026-09-22 11.02.55.excalidraw.md"
   ]
 }

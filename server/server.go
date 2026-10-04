@@ -7,14 +7,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/lightsigma96/the_distributed_stack/types"
+	"github.com/segmentio/kafka-go"
 	"log"
 	"net"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/lightsigma96/the_distributed_stack/types"
-	"github.com/segmentio/kafka-go"
 )
 
 // cluster node
@@ -53,18 +52,10 @@ Request format is:
 func parse_cli_req(req []byte, node *ClusterNode) bool {
 	lines := strings.Split(string(req), "\r\n")
 
-	//identifier := lines[0]
-	// TODO(Me): check if correct identifier
-	//if identifier == "" {
-	//	return false
-	//}
-
-	for _, line := range lines[1:] {
+	for _, line := range lines[:] {
 		if line == "" {
 			break
 		}
-
-		// TODO(AI Suggest): this_node_addr = assign this node addr
 
 		// TODO(Me): return false when line is wrong
 
@@ -76,6 +67,7 @@ func parse_cli_req(req []byte, node *ClusterNode) bool {
 		}
 
 		node.out_bound_connections = append(node.out_bound_connections, &conn)
+		node.in_bound_connections = append(node.in_bound_connections, &conn)
 	}
 	return true
 }
@@ -218,8 +210,11 @@ func ingestion(camera_conn *net.UDPConn, kafka_conns []*kafka.Conn, current_part
 }
 
 /*
-on-wire format of PING : "addr_of_this_server\nPING\n" & same for PONG
+on-wire format of PING : "PING\n" & same for PONG
+
 returns addr of node which did not respond pong
+
+NOTE : PING and PONG are both followed by \n as there might be other messsages, hence having \n delimiter
 */
 func (n *ClusterNode) pingAll() []string {
 	var ws sync.WaitGroup
@@ -231,12 +226,12 @@ func (n *ClusterNode) pingAll() []string {
 	for i := 0; i < len(n.out_bound_connections); i++ {
 		conn := *n.out_bound_connections[i]
 		ws.Go(func() {
-			if _, err := fmt.Fprintf(conn, "%s\nPING\n", conn.LocalAddr().String()); err != nil {
+			if _, err := fmt.Fprintf(conn, "PING\n"); err != nil {
 				log.Println("Error sending PING:", err)
 				return
 			}
 
-			if err := conn.SetReadDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+			if err := conn.SetReadDeadline(time.Now().Add(60 * time.Millisecond)); err != nil {
 				log.Println("Couldn't set read deadline:", err)
 				return
 			}
@@ -269,7 +264,7 @@ func (n *ClusterNode) pingAll() []string {
 			}
 			pong := scanner.Text()
 
-			if pong != "PONG" {
+			if pong != "PONG\n" {
 				fmt.Printf("Incorrect PONG received from %s\n", pongAddr)
 				fp_mut.Lock()
 				fault_pongs = append(fault_pongs, pongAddr)
@@ -288,6 +283,7 @@ func (n *ClusterNode) pingAll() []string {
 /* Sleeps for 100ms after every iteration. This is the main loop for this server (add go routine to ping to make it concurrent) */
 func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 	for {
+		log.Printf("Number of connections in out_bound : %d and in_bound : %d", len(node.out_bound_connections), len(node.in_bound_connections)) // both should have 1 for 2 servers
 		// accept incoming connections (10ms deadline)
 		err := node.listening_conn.SetDeadline(time.Now().Add(time.Millisecond * 10))
 		if err != nil {
@@ -313,7 +309,24 @@ func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 		// check on other servers
 		for _, fn := range node.pingAll() {
 			// TODO: set in pfail or fail
-			log.Printf("This node did not send a PONG %s", fn)
+			log.Printf("Did not recieve a PONG from %s", fn)
+		}
+
+		// first handle incoming connections and then send PINGs (i.e. reply before asking)
+		for _, conn := range node.in_bound_connections {
+			scanner := bufio.NewScanner(*conn)
+			if !scanner.Scan() {
+				if serr := scanner.Err(); serr != nil {
+					log.Printf("Error reading from connection: %s", (*conn).RemoteAddr())
+					continue
+				}
+
+				if scanner.Text() == "PING\n" {
+					if _, err := fmt.Fprintf(*conn, "PING\n"); err != nil {
+						log.Println("Error sending PONG: ", err)
+					}
+				}
+			}
 		}
 
 		time.Sleep(time.Millisecond * 100)
@@ -323,6 +336,8 @@ func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 func main() {
 
 	listening_addr := flag.String("server_address", "nil", "Specify address of server to start on")
+	cameras_addr := flag.Int("cam_addr", 0, "Specify address of camera to listen on")
+	flag.Parse()
 
 	addr, err := net.ResolveTCPAddr("tcp4", *listening_addr)
 	if err != nil {
@@ -346,7 +361,7 @@ func main() {
 	const topic = "camera-topic"
 
 	cam_conn, err := net.ListenUDP("udp4", &net.UDPAddr{
-		Port: 8080,
+		Port: *cameras_addr,
 	})
 
 	if err != nil {

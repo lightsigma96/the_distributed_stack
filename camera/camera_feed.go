@@ -2,14 +2,20 @@ package main
 
 import (
 	"encoding/binary"
-	"github.com/lightsigma96/the_distributed_stack/types"
+	"flag"
 	"log"
 	"net"
 	"time"
+
+	"github.com/lightsigma96/the_distributed_stack/types"
 )
 
 func main() {
-	server_conn, err := net.Dial("udp4", "127.0.0.1:8080")
+	// this here is the udp listening socket address
+	server_addr := flag.String("server_addr", "nil", "Specify address of server to connect to")
+	flag.Parse()
+
+	server_conn, err := net.Dial("udp4", *server_addr)
 
 	if err != nil {
 		log.Fatalln("COULD NOT START SERVER")
