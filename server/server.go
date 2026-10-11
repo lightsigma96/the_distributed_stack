@@ -257,9 +257,33 @@ func (n *ClusterNode) pingAll() []string {
 				}
 			}()
 
-			// Handle incoming PINGs until the PONG for our PING arrives.
-			for {
-				message, err := reader.ReadString('\n')
+			// Read one message first. If it is a peer PING, reply before
+			// waiting for the PONG corresponding to our own PING.
+			message, err := reader.ReadString('\n')
+			if err != nil {
+				fp_mut.Lock()
+				fault_pongs = append(fault_pongs, conn.RemoteAddr().String())
+				fp_mut.Unlock()
+
+				var timeoutErr net.Error
+				if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+					log.Printf("Read timed out waiting for a message from %s", conn.RemoteAddr())
+				} else {
+					log.Printf("Error receiving message from %s: %v", conn.RemoteAddr(), err)
+				}
+				return
+			}
+
+			switch strings.TrimSuffix(message, "\n") {
+			case "PING":
+				if _, err := fmt.Fprintf(conn, "PONG\n"); err != nil {
+					log.Println("Error sending PONG:", err)
+					return
+				}
+
+				// After replying to the peer's PING, wait briefly for
+				// the PONG to our own PING.
+				message, err = reader.ReadString('\n')
 				if err != nil {
 					fp_mut.Lock()
 					fault_pongs = append(fault_pongs, conn.RemoteAddr().String())
@@ -269,26 +293,24 @@ func (n *ClusterNode) pingAll() []string {
 					if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
 						log.Printf("Read timed out waiting for PONG from %s", conn.RemoteAddr())
 					} else {
-						log.Printf("Error receiving message from %s: %v", conn.RemoteAddr(), err)
+						log.Printf("Error receiving PONG from %s: %v", conn.RemoteAddr(), err)
 					}
 					return
 				}
-
-				switch strings.TrimSuffix(message, "\n") {
-				case "PING":
-					if _, err := fmt.Fprintf(conn, "PONG\n"); err != nil {
-						log.Println("Error sending PONG:", err)
-						return
-					}
-				case "PONG":
-					return
-				default:
-					log.Printf("Unexpected message from %s: %q", conn.RemoteAddr(), strings.TrimSuffix(message, "\n"))
+				if strings.TrimSuffix(message, "\n") != "PONG" {
+					log.Printf("Expected PONG from %s, got %q", conn.RemoteAddr(), strings.TrimSuffix(message, "\n"))
 					fp_mut.Lock()
 					fault_pongs = append(fault_pongs, conn.RemoteAddr().String())
 					fp_mut.Unlock()
-					return
 				}
+			case "PONG":
+				// The peer has already answered our PING.
+				return
+			default:
+				log.Printf("Unexpected message from %s: %q", conn.RemoteAddr(), strings.TrimSuffix(message, "\n"))
+				fp_mut.Lock()
+				fault_pongs = append(fault_pongs, conn.RemoteAddr().String())
+				fp_mut.Unlock()
 			}
 		})
 	}
