@@ -7,13 +7,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/lightsigma96/the_distributed_stack/types"
-	"github.com/segmentio/kafka-go"
 	"log"
 	"net"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/lightsigma96/the_distributed_stack/types"
+	"github.com/segmentio/kafka-go"
 )
 
 // cluster node
@@ -223,11 +224,25 @@ func (n *ClusterNode) pingAll() []string {
 	for i := 0; i < len(n.connections); i++ {
 		conn := *n.connections[i]
 		ws.Go(func() {
+			// Send PING
 			if _, err := fmt.Fprintf(conn, "PING\n"); err != nil {
 				log.Println("Error sending PING:", err)
 				return
 			}
 
+			// Process PINGs on ME
+			process_pongs_scanner := bufio.NewScanner(conn)
+
+			if process_pongs_scanner.Scan() {
+				if process_pongs_scanner.Text() != "PING" {
+					if _, err := fmt.Fprintf(conn, "PONG\n"); err != nil {
+						log.Println("Error sending PONG:", err)
+						return
+					}
+				}
+			}
+
+			// Now wait for my PING
 			if err := conn.SetReadDeadline(time.Now().Add(60 * time.Millisecond)); err != nil {
 				log.Println("Couldn't set read deadline:", err)
 				return
@@ -303,21 +318,6 @@ func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 		for _, fn := range node.pingAll() {
 			// TODO: set in pfail or fail
 			log.Printf("Did not recieve a PONG from %s", fn)
-		}
-
-		// PONG
-		for _, conn := range node.connections {
-			(*conn).SetReadDeadline(time.Now().Add(time.Millisecond * 60))
-			scanner := bufio.NewScanner(*conn)
-			if scanner.Scan() {
-				if scanner.Text() == "PING" {
-					if _, err := fmt.Fprintf(*conn, "PONG\n"); err != nil {
-						log.Println("Error sending PONG:", err)
-					}
-				}
-			} else if err := scanner.Err(); err != nil {
-				log.Printf("Error reading from %s: %v", (*conn).RemoteAddr(), err)
-			}
 		}
 
 		time.Sleep(time.Millisecond * 100)
