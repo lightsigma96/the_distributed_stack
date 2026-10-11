@@ -22,10 +22,14 @@ type ClusterNode struct {
 	// connections
 	connections []*net.Conn
 
+	// One persistent reader per connection, so buffered bytes are not lost
+	// between cron iterations.
+	readerMu sync.Mutex
+	readers  map[net.Conn]*bufio.Reader
+
 	// listener for cluster
 	listening_conn *net.TCPListener
 }
-
 // represents all the states needed by ClusterCron
 type ClusterCronStates struct {
 	camera_conn       *net.UDPConn
@@ -219,74 +223,78 @@ func (n *ClusterNode) pingAll() []string {
 	var fault_pongs []string
 	var fp_mut sync.Mutex
 
-	// make routine, wait for first response (have a deadline), now check correctness, only now get the lock once and add if fault.
-
 	for i := 0; i < len(n.connections); i++ {
 		conn := *n.connections[i]
 		ws.Go(func() {
-			// Send PING
 			if _, err := fmt.Fprintf(conn, "PING\n"); err != nil {
 				log.Println("Error sending PING:", err)
+				fp_mut.Lock()
+				fault_pongs = append(fault_pongs, conn.RemoteAddr().String())
+				fp_mut.Unlock()
 				return
 			}
 
-			// Process PINGs on ME
-			process_pongs_scanner := bufio.NewScanner(conn)
-
-			if process_pongs_scanner.Scan() {
-				if process_pongs_scanner.Text() != "PING" {
-					if _, err := fmt.Fprintf(conn, "PONG\n"); err != nil {
-						log.Println("Error sending PONG:", err)
-						return
-					}
-				}
+			// Reuse the reader for this connection across cron iterations.
+			n.readerMu.Lock()
+			if n.readers == nil {
+				n.readers = make(map[net.Conn]*bufio.Reader)
 			}
+			reader := n.readers[conn]
+			if reader == nil {
+				reader = bufio.NewReader(conn)
+				n.readers[conn] = reader
+			}
+			n.readerMu.Unlock()
 
-			// Now wait for my PING
+			// Bound every read, including the first one.
 			if err := conn.SetReadDeadline(time.Now().Add(60 * time.Millisecond)); err != nil {
 				log.Println("Couldn't set read deadline:", err)
 				return
 			}
-
 			defer func() {
 				if err := conn.SetReadDeadline(time.Time{}); err != nil {
 					log.Println("Couldn't clear read deadline:", err)
 				}
 			}()
 
-			scanner := bufio.NewScanner(conn)
-
-			if !scanner.Scan() {
-				var timedout net.Error
-
-				if err := scanner.Err(); err != nil {
+			// Handle incoming PINGs until the PONG for our PING arrives.
+			for {
+				message, err := reader.ReadString('\n')
+				if err != nil {
 					fp_mut.Lock()
 					fault_pongs = append(fault_pongs, conn.RemoteAddr().String())
 					fp_mut.Unlock()
 
-					if errors.As(err, &timedout) && timedout.Timeout() {
-						fmt.Println("Read timed out for PONG")
-						return
+					var timeoutErr net.Error
+					if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+						log.Printf("Read timed out waiting for PONG from %s", conn.RemoteAddr())
+					} else {
+						log.Printf("Error receiving message from %s: %v", conn.RemoteAddr(), err)
 					}
-
-					log.Println("Error receiving PONG:", err)
 					return
 				}
-			}
-			pong := scanner.Text()
 
-			if pong != "PONG" {
-				fmt.Printf("Incorrect PONG received from %s\n", conn.RemoteAddr().String())
-				fp_mut.Lock()
-				fault_pongs = append(fault_pongs, conn.RemoteAddr().String())
-				fp_mut.Unlock()
+				switch strings.TrimSuffix(message, "\n") {
+				case "PING":
+					if _, err := fmt.Fprintf(conn, "PONG\n"); err != nil {
+						log.Println("Error sending PONG:", err)
+						return
+					}
+				case "PONG":
+					return
+				default:
+					log.Printf("Unexpected message from %s: %q", conn.RemoteAddr(), strings.TrimSuffix(message, "\n"))
+					fp_mut.Lock()
+					fault_pongs = append(fault_pongs, conn.RemoteAddr().String())
+					fp_mut.Unlock()
+					return
+				}
 			}
 		})
 	}
 	ws.Wait()
 	return fault_pongs
 }
-
 /* Sleeps for 100ms after every iteration. This is the main loop for this server (add go routine to ping to make it concurrent) */
 func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 	for {
