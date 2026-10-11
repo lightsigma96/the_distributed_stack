@@ -200,11 +200,14 @@
   },
   "active": "4cda998c7ef628ba",
   "lastOpenFiles": [
-    "notes/Excalidraw/Drawing 2026-09-18 16.35.33.excalidraw.md",
     "server/server.go~",
-    "server/cli-tool.py~",
-    "server/4913",
     "camera/camera_feed.go~",
+    "server/4913",
+    "run_tds_tmux.sh~",
+    "run_tds_tmux.sh",
+    "Unconfirmed 879545.crdownload",
+    "notes/Excalidraw/Drawing 2026-09-18 16.35.33.excalidraw.md",
+    "server/cli-tool.py~",
     "camera/4913",
     "server/cli-tool.py",
     "server/cli-tool.go~",
@@ -212,8 +215,6 @@
     "notes/Excalidraw/Pasted Image 20260920171649_843.png",
     "notes/Scaling with Kafka.md",
     "ml/ml.go~",
-    "create_topic.sh~",
-    "create_topic.sh",
     "Excalidraw/Drawing 2026-09-22 11.02.55.excalidraw.md"
   ]
 }

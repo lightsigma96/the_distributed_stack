@@ -90,9 +90,9 @@ func wait_for_clireq(node *ClusterNode) {
 
 		if parse_cli_req(cli_msg[:n], node) {
 			response_to_cli := "\nOK FORMED A CLUSTER"
-			if _, err := cli_req.Write([]byte(response_to_cli)); err != nil {
-				log.Println("Error sending response to cli:", err)
-			}
+			//if _, err := cli_req.Write([]byte(response_to_cli)); err != nil {
+			//	log.Println("Error sending response to cli:", err)
+			//}
 			log.Println(response_to_cli)
 			cli_req.Close()
 			return
@@ -233,16 +233,30 @@ func (n *ClusterNode) pingAll() []string {
 				return
 			}
 
+			defer func() {
+				if err := conn.SetReadDeadline(time.Time{}); err != nil {
+					log.Println("Couldn't clear read deadline:", err)
+				}
+			}()
+
 			scanner := bufio.NewScanner(conn)
 
 			if !scanner.Scan() {
+				var timedout net.Error
+
 				if err := scanner.Err(); err != nil {
-					log.Println("Error receiving PONG:", err)
 					fp_mut.Lock()
 					fault_pongs = append(fault_pongs, conn.RemoteAddr().String())
 					fp_mut.Unlock()
+
+					if errors.As(err, &timedout) && timedout.Timeout() {
+						fmt.Println("Read timed out for PONG")
+						return
+					}
+
+					log.Println("Error receiving PONG:", err)
+					return
 				}
-				return
 			}
 			pong := scanner.Text()
 
@@ -251,10 +265,6 @@ func (n *ClusterNode) pingAll() []string {
 				fp_mut.Lock()
 				fault_pongs = append(fault_pongs, conn.RemoteAddr().String())
 				fp_mut.Unlock()
-			}
-
-			if err := conn.SetReadDeadline(time.Time{}); err != nil {
-				log.Println("Couldn't clear read deadline:", err)
 			}
 		})
 	}
@@ -300,16 +310,13 @@ func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 			(*conn).SetReadDeadline(time.Now().Add(time.Millisecond * 60))
 			scanner := bufio.NewScanner(*conn)
 			if scanner.Scan() {
-				if serr := scanner.Err(); serr != nil {
-					log.Printf("Error reading from connection: %s", (*conn).RemoteAddr())
-					continue
-				}
-
 				if scanner.Text() == "PING" {
 					if _, err := fmt.Fprintf(*conn, "PONG\n"); err != nil {
-						log.Println("Error sending PONG: ", err)
+						log.Println("Error sending PONG:", err)
 					}
 				}
+			} else if err := scanner.Err(); err != nil {
+				log.Printf("Error reading from %s: %v", (*conn).RemoteAddr(), err)
 			}
 		}
 
@@ -352,7 +359,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	defer cam_conn.Close()
+	defer cam_conn.Close() // in cleanup func
 
 	// Form connection with kafka
 	kafka_conns := make([]*kafka.Conn, types.MAX_PARTITION)
