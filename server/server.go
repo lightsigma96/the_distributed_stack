@@ -10,26 +10,29 @@ import (
 	"log"
 	"net"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/lightsigma96/the_distributed_stack/types"
 	"github.com/segmentio/kafka-go"
 )
 
+type ping_status struct {
+	ping_sent int
+
+	// unix epoch time in seconds, -1 means null
+	deadline time.Time
+}
+
 // cluster node
 type ClusterNode struct {
 	// connections
 	connections []*net.Conn
-
-	// One persistent reader per connection, so buffered bytes are not lost
-	// between cron iterations.
-	readerMu sync.Mutex
-	readers  map[net.Conn]*bufio.Reader
+	ping_sent   []ping_status
 
 	// listener for cluster
 	listening_conn *net.TCPListener
 }
+
 // represents all the states needed by ClusterCron
 type ClusterCronStates struct {
 	camera_conn       *net.UDPConn
@@ -70,6 +73,7 @@ func parse_cli_req(req []byte, node *ClusterNode) bool {
 
 		// in bound should have listen and outbound dial
 		node.connections = append(node.connections, &conn)
+		node.ping_sent = append(node.ping_sent, ping_status{0, -1})
 	}
 	return true
 }
@@ -211,6 +215,39 @@ func ingestion(camera_conn *net.UDPConn, kafka_conns []*kafka.Conn, current_part
 	}
 }
 
+/* Reads with a particular deadline, purpose is that reads should not be blocking, handles errors internally */
+func ReadWithDeadline(conn *net.Conn) string {
+	c := *conn
+
+	if err := c.SetReadDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		log.Println("Couldn't set read deadline:", err)
+		return ""
+	}
+
+	defer func() {
+		if err := c.SetReadDeadline(time.Time{}); err != nil {
+			log.Println("Couldn't clear read deadline:", err)
+		}
+	}()
+
+	scn := bufio.NewScanner(c)
+
+	if !scn.Scan() {
+		if err := scn.Err(); err != nil {
+			var timeoutErr net.Error
+			if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+				log.Println("Read timed out")
+				return ""
+			}
+
+			log.Println("Error reading from connection:", err)
+		}
+		return "" // Connection closed or no message received
+	}
+
+	return scn.Text()
+}
+
 /*
 on-wire format of PING : "PING\n" & same for PONG
 
@@ -218,105 +255,45 @@ returns addr of node which did not respond pong
 
 NOTE : PING and PONG are both followed by \n as there might be other messsages, hence having \n delimiter
 */
-func (n *ClusterNode) pingAll() []string {
-	var ws sync.WaitGroup
-	var fault_pongs []string
-	var fp_mut sync.Mutex
+func check_health(n *ClusterNode) {
+	/* Be self-centered, just do your task */
 
 	for i := 0; i < len(n.connections); i++ {
-		conn := *n.connections[i]
-		ws.Go(func() {
-			if _, err := fmt.Fprintf(conn, "PING\n"); err != nil {
-				log.Println("Error sending PING:", err)
-				fp_mut.Lock()
-				fault_pongs = append(fault_pongs, conn.RemoteAddr().String())
-				fp_mut.Unlock()
-				return
+		conn := n.connections[i]
+
+		// first check if ping has been sent to this conn
+		switch n.ping_sent[i].ping_sent {
+		case 0:
+			if _, err := fmt.Fprintf(*conn, "PING\n"); err != nil {
+				log.Println("Error sending PING node %s: %s", n.listening_conn.Addr().String(), err)
+				continue
+			}
+			n.ping_sent[i].deadline = time.Now()
+		case 1:
+			// check for pong within deadline
+			check_for_pong := ReadWithDeadline(conn)
+
+			if time.Now().Compare(n.ping_sent[i].deadline) > 0 {
+				log.Printf("FAILING NODE: %s", (*conn).RemoteAddr().String())
 			}
 
-			// Reuse the reader for this connection across cron iterations.
-			n.readerMu.Lock()
-			if n.readers == nil {
-				n.readers = make(map[net.Conn]*bufio.Reader)
+			if check_for_pong == "PONG" {
+				log.Printf("RECIEVED PONG FROM: %s", (*conn).RemoteAddr().String())
+				n.ping_sent[i].ping_sent = 0
 			}
-			reader := n.readers[conn]
-			if reader == nil {
-				reader = bufio.NewReader(conn)
-				n.readers[conn] = reader
+		}
+
+		// my turn to account for whatever msg with this conn
+		whatever_msg := ReadWithDeadline(conn)
+
+		if whatever_msg == "PING" {
+			if _, err := fmt.Fprintf(*conn, "PONG\n"); err != nil {
+				log.Printf("ERROR IN ACCOUNTING FOR PING FOR: %s", (*conn).LocalAddr())
 			}
-			n.readerMu.Unlock()
-
-			// Bound every read, including the first one.
-			if err := conn.SetReadDeadline(time.Now().Add(60 * time.Millisecond)); err != nil {
-				log.Println("Couldn't set read deadline:", err)
-				return
-			}
-			defer func() {
-				if err := conn.SetReadDeadline(time.Time{}); err != nil {
-					log.Println("Couldn't clear read deadline:", err)
-				}
-			}()
-
-			// Read one message first. If it is a peer PING, reply before
-			// waiting for the PONG corresponding to our own PING.
-			message, err := reader.ReadString('\n')
-			if err != nil {
-				fp_mut.Lock()
-				fault_pongs = append(fault_pongs, conn.RemoteAddr().String())
-				fp_mut.Unlock()
-
-				var timeoutErr net.Error
-				if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
-					log.Printf("Read timed out waiting for a message from %s", conn.RemoteAddr())
-				} else {
-					log.Printf("Error receiving message from %s: %v", conn.RemoteAddr(), err)
-				}
-				return
-			}
-
-			switch strings.TrimSuffix(message, "\n") {
-			case "PING":
-				if _, err := fmt.Fprintf(conn, "PONG\n"); err != nil {
-					log.Println("Error sending PONG:", err)
-					return
-				}
-
-				// After replying to the peer's PING, wait briefly for
-				// the PONG to our own PING.
-				message, err = reader.ReadString('\n')
-				if err != nil {
-					fp_mut.Lock()
-					fault_pongs = append(fault_pongs, conn.RemoteAddr().String())
-					fp_mut.Unlock()
-
-					var timeoutErr net.Error
-					if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
-						log.Printf("Read timed out waiting for PONG from %s", conn.RemoteAddr())
-					} else {
-						log.Printf("Error receiving PONG from %s: %v", conn.RemoteAddr(), err)
-					}
-					return
-				}
-				if strings.TrimSuffix(message, "\n") != "PONG" {
-					log.Printf("Expected PONG from %s, got %q", conn.RemoteAddr(), strings.TrimSuffix(message, "\n"))
-					fp_mut.Lock()
-					fault_pongs = append(fault_pongs, conn.RemoteAddr().String())
-					fp_mut.Unlock()
-				}
-			case "PONG":
-				// The peer has already answered our PING.
-				return
-			default:
-				log.Printf("Unexpected message from %s: %q", conn.RemoteAddr(), strings.TrimSuffix(message, "\n"))
-				fp_mut.Lock()
-				fault_pongs = append(fault_pongs, conn.RemoteAddr().String())
-				fp_mut.Unlock()
-			}
-		})
+		}
 	}
-	ws.Wait()
-	return fault_pongs
 }
+
 /* Sleeps for 100ms after every iteration. This is the main loop for this server (add go routine to ping to make it concurrent) */
 func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 	for {
@@ -344,11 +321,8 @@ func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 		// send new events (TODO (me): how much time does this func takes in ms)
 		ingestion(states.camera_conn, states.kafka_conns, &states.current_partition)
 
-		// PING
-		for _, fn := range node.pingAll() {
-			// TODO: set in pfail or fail
-			log.Printf("Did not recieve a PONG from %s", fn)
-		}
+		// Check Health
+		check_health(node)
 
 		time.Sleep(time.Millisecond * 100)
 	}
