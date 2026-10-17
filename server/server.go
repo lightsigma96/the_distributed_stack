@@ -16,11 +16,11 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
+const pingTimeout = time.Second
+
 type ping_status struct {
 	ping_sent int
-
-	// unix epoch time in seconds, -1 means null
-	deadline time.Time
+	deadline  time.Time
 }
 
 // cluster node
@@ -73,7 +73,7 @@ func parse_cli_req(req []byte, node *ClusterNode) bool {
 
 		// in bound should have listen and outbound dial
 		node.connections = append(node.connections, &conn)
-		node.ping_sent = append(node.ping_sent, ping_status{0, -1})
+		node.ping_sent = append(node.ping_sent, ping_status{})
 	}
 	return true
 }
@@ -116,15 +116,10 @@ func wait_for_clireq(node *ClusterNode) {
 	}
 }
 
-/*
-	Cron functions
-*/
-
 /* pushses a event into kafka partition */
 
 func produce_event(conn *kafka.Conn, event types.Packet) {
 	var send_event []byte
-
 	id_slice := make([]byte, 8)
 	binary.BigEndian.PutUint64(id_slice, event.CameraID)
 	send_event = append(send_event, id_slice...)
@@ -172,11 +167,9 @@ func ingestion(camera_conn *net.UDPConn, kafka_conns []*kafka.Conn, current_part
 	}
 
 	var p types.Packet
-
 	p.CameraID = binary.BigEndian.Uint64(raw[0:8])
 
 	addressLen := int(binary.BigEndian.Uint32(raw[8:12]))
-
 	addressStart := 12
 	addressEnd := addressStart + addressLen
 
@@ -190,7 +183,6 @@ func ingestion(camera_conn *net.UDPConn, kafka_conns []*kafka.Conn, current_part
 	dataLen := int(binary.BigEndian.Uint32(
 		raw[addressEnd : addressEnd+4],
 	))
-
 	dataStart := addressEnd + 4
 	dataEnd := dataStart + dataLen
 
@@ -200,7 +192,6 @@ func ingestion(camera_conn *net.UDPConn, kafka_conns []*kafka.Conn, current_part
 	}
 
 	copy(p.Data[:], raw[dataStart:dataEnd])
-
 	fmt.Printf("Partition: %d\n", *current_partition)
 
 	produce_event(
@@ -239,10 +230,9 @@ func ReadWithDeadline(conn *net.Conn) string {
 				log.Println("Read timed out")
 				return ""
 			}
-
 			log.Println("Error reading from connection:", err)
 		}
-		return "" // Connection closed or no message received
+		return ""
 	}
 
 	return scn.Text()
@@ -261,31 +251,28 @@ func check_health(n *ClusterNode) {
 	for i := 0; i < len(n.connections); i++ {
 		conn := n.connections[i]
 
-		// first check if ping has been sent to this conn
 		switch n.ping_sent[i].ping_sent {
 		case 0:
 			if _, err := fmt.Fprintf(*conn, "PING\n"); err != nil {
-				log.Println("Error sending PING node %s: %s", n.listening_conn.Addr().String(), err)
+				log.Printf("Error sending PING to node %s: %v", (*conn).RemoteAddr(), err)
 				continue
 			}
-			n.ping_sent[i].deadline = time.Now()
+			n.ping_sent[i].ping_sent = 1
+			n.ping_sent[i].deadline = time.Now().Add(pingTimeout)
+
 		case 1:
-			// check for pong within deadline
 			check_for_pong := ReadWithDeadline(conn)
 
-			if time.Now().Compare(n.ping_sent[i].deadline) > 0 {
-				log.Printf("FAILING NODE: %s", (*conn).RemoteAddr().String())
-			}
-
 			if check_for_pong == "PONG" {
-				log.Printf("RECIEVED PONG FROM: %s", (*conn).RemoteAddr().String())
-				n.ping_sent[i].ping_sent = 0
+				log.Printf("RECEIVED PONG FROM: %s", (*conn).RemoteAddr())
+				n.ping_sent[i] = ping_status{}
+			} else if time.Now().After(n.ping_sent[i].deadline) {
+				log.Printf("FAILING NODE: %s", (*conn).RemoteAddr())
 			}
 		}
 
-		// my turn to account for whatever msg with this conn
+		// This message handling is intentionally unchanged for issue 4.
 		whatever_msg := ReadWithDeadline(conn)
-
 		if whatever_msg == "PING" {
 			if _, err := fmt.Fprintf(*conn, "PONG\n"); err != nil {
 				log.Printf("ERROR IN ACCOUNTING FOR PING FOR: %s", (*conn).LocalAddr())
@@ -297,8 +284,6 @@ func check_health(n *ClusterNode) {
 /* Sleeps for 100ms after every iteration. This is the main loop for this server (add go routine to ping to make it concurrent) */
 func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 	for {
-		//log.Printf("Number of connections in out_bound : %d and in_bound : %d", len(node.connections), len(node.in_bound_connections)) // both should have 1 for 2 servers
-
 		// accept incoming connections (10ms deadline)
 		err := node.listening_conn.SetDeadline(time.Now().Add(time.Millisecond * 10))
 		if err != nil {
@@ -315,6 +300,7 @@ func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 				}
 			} else {
 				node.connections = append(node.connections, &new_inbound_client)
+				node.ping_sent = append(node.ping_sent, ping_status{})
 			}
 		}
 
@@ -329,7 +315,6 @@ func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 }
 
 func main() {
-
 	listening_addr := flag.String("server_address", "nil", "Specify address of server to start on")
 	cameras_addr := flag.Int("cam_addr", 0, "Specify address of camera to listen on")
 	flag.Parse()
@@ -346,7 +331,6 @@ func main() {
 
 	var node ClusterNode
 	var cluster_state ClusterCronStates
-
 	node.listening_conn = listen_conn
 
 	// become a part of cluster
@@ -354,20 +338,16 @@ func main() {
 
 	// Form connection with cameras
 	const topic = "camera-topic"
-
 	cam_conn, err := net.ListenUDP("udp4", &net.UDPAddr{
 		Port: *cameras_addr,
 	})
-
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	defer cam_conn.Close() // in cleanup func
+	defer cam_conn.Close()
 
 	// Form connection with kafka
 	kafka_conns := make([]*kafka.Conn, types.MAX_PARTITION)
-
 	for partition := 0; partition < types.MAX_PARTITION; partition++ {
 		kafka_conn, err := kafka.DialLeader(
 			context.Background(),
@@ -376,18 +356,11 @@ func main() {
 			topic,
 			partition,
 		)
-
 		if err != nil {
-			log.Fatalf(
-				"failed to connect to partition %d: %v",
-				partition,
-				err,
-			)
+			log.Fatalf("failed to connect to partition %d: %v", partition, err)
 		}
-
 		kafka_conns[partition] = kafka_conn
 	}
-
 	defer func() {
 		for _, kafka_conn := range kafka_conns {
 			kafka_conn.Close()
@@ -397,6 +370,5 @@ func main() {
 	cluster_state.camera_conn = cam_conn
 	cluster_state.kafka_conns = kafka_conns
 	cluster_state.current_partition = 0
-
 	clusterCron(&node, &cluster_state)
 }
