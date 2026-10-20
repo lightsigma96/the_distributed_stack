@@ -7,13 +7,12 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/lightsigma96/the_distributed_stack/types"
+	"github.com/segmentio/kafka-go"
 	"log"
 	"net"
 	"strings"
 	"time"
-
-	"github.com/lightsigma96/the_distributed_stack/types"
-	"github.com/segmentio/kafka-go"
 )
 
 const pingTimeout = time.Second
@@ -23,11 +22,16 @@ type ping_status struct {
 	deadline  time.Time
 }
 
+type ConnectionState struct {
+	ping        ping_status
+	conn_reader bufio.Reader
+	conn        net.Conn
+}
+
 // cluster node
 type ClusterNode struct {
 	// connections
-	connections []*net.Conn
-	ping_sent   []ping_status
+	connections []ConnectionState
 
 	// listener for cluster
 	listening_conn *net.TCPListener
@@ -72,8 +76,8 @@ func parse_cli_req(req []byte, node *ClusterNode) bool {
 		}
 
 		// in bound should have listen and outbound dial
-		node.connections = append(node.connections, &conn)
-		node.ping_sent = append(node.ping_sent, ping_status{})
+
+		node.connections = append(node.connections, ConnectionState{ping_status{}, *bufio.NewReader(conn), conn})
 	}
 	return true
 }
