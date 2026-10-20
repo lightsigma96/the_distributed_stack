@@ -27,6 +27,7 @@ type ConnectionState struct {
 	ping        ping_status
 	conn_reader bufio.Reader
 	conn        net.Conn
+	node_addr   string
 }
 
 // cluster node
@@ -54,8 +55,8 @@ Fills out_bound_connections
 
 Request format is:
 
-1st node \r\n
-2nd node \r\n
+1st node addr\r\n
+2nd node addr\r\n
 ...
 \r\n\r\n
 */
@@ -78,7 +79,7 @@ func parse_cli_req(req []byte, node *ClusterNode) bool {
 
 		// in bound should have listen and outbound dial
 
-		node.connections = append(node.connections, ConnectionState{ping_status{}, *bufio.NewReader(conn), conn})
+		node.connections = append(node.connections, ConnectionState{ping_status{}, *bufio.NewReader(conn), conn, line})
 	}
 	return true
 }
@@ -257,28 +258,29 @@ func check_health(n *ClusterNode) {
 		switch state.ping.ping_sent {
 		case 0:
 			if _, err := fmt.Fprintf(conn, "PING\n"); err != nil {
-				log.Printf("Error sending PING to node %s: %v", conn.RemoteAddr(), err)
+				log.Printf("Error sending PING to node %s: %v", state.node_addr, err)
 				continue
 			}
 			state.ping.ping_sent = 1
 			state.ping.deadline = time.Now().Add(pingTimeout)
 
 		case 1:
-			check_for_pong := ReadWithDeadline(state)
+			node_msg := ReadWithDeadline(state)
 
-			if check_for_pong == "PONG" {
-				log.Printf("RECEIVED PONG FROM: %s", conn.RemoteAddr())
-				state.ping = ping_status{}
-			} else if time.Now().After(state.ping.deadline) {
-				log.Printf("FAILING NODE: %s", conn.RemoteAddr())
-			}
-		}
-
-		// This message handling is intentionally unchanged for issue 4.
-		whatever_msg := ReadWithDeadline(state)
-		if whatever_msg == "PING" {
-			if _, err := fmt.Fprintf(conn, "PONG\n"); err != nil {
-				log.Printf("ERROR IN ACCOUNTING FOR PING FOR: %s", conn.LocalAddr())
+			if !time.Now().After(state.ping.deadline) {
+				if node_msg == "PONG" {
+					log.Printf("RECEIVED PONG FROM: %s", state.node_addr)
+					state.ping = ping_status{}
+				} else {
+					if node_msg == "PING" {
+						if _, err := fmt.Fprintf(conn, "PONG\n"); err != nil {
+							log.Printf("ERROR IN ACCOUNTING FOR PING FOR: %s", state.node_addr)
+						}
+					}
+					// handle whatever the msg is
+				}
+			} else {
+				log.Printf("FAILING NODE: %s", state.node_addr)
 			}
 		}
 	}
