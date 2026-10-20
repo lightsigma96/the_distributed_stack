@@ -7,12 +7,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/lightsigma96/the_distributed_stack/types"
-	"github.com/segmentio/kafka-go"
 	"log"
 	"net"
 	"strings"
 	"time"
+
+	"github.com/lightsigma96/the_distributed_stack/types"
+	"github.com/segmentio/kafka-go"
 )
 
 const pingTimeout = time.Second
@@ -211,35 +212,32 @@ func ingestion(camera_conn *net.UDPConn, kafka_conns []*kafka.Conn, current_part
 }
 
 /* Reads with a particular deadline, purpose is that reads should not be blocking, handles errors internally */
-func ReadWithDeadline(conn *net.Conn) string {
-	c := *conn
-
-	if err := c.SetReadDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+func ReadWithDeadline(state *ConnectionState) string {
+	if err := state.conn.SetReadDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
 		log.Println("Couldn't set read deadline:", err)
 		return ""
 	}
 
 	defer func() {
-		if err := c.SetReadDeadline(time.Time{}); err != nil {
+		if err := state.conn.SetReadDeadline(time.Time{}); err != nil {
 			log.Println("Couldn't clear read deadline:", err)
 		}
 	}()
 
-	scn := bufio.NewScanner(c)
-
-	if !scn.Scan() {
-		if err := scn.Err(); err != nil {
-			var timeoutErr net.Error
-			if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
-				log.Println("Read timed out")
-				return ""
-			}
+	message, err := state.conn_reader.ReadString('\n')
+	if err != nil {
+		var timeoutErr net.Error
+		if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+			log.Println("Read timed out")
+			return ""
+		}
+		if !errors.Is(err, net.ErrClosed) {
 			log.Println("Error reading from connection:", err)
 		}
 		return ""
 	}
 
-	return scn.Text()
+	return strings.TrimSuffix(strings.TrimSuffix(message, "\n"), "\r")
 }
 
 /*
@@ -253,33 +251,34 @@ func check_health(n *ClusterNode) {
 	/* Be self-centered, just do your task */
 
 	for i := 0; i < len(n.connections); i++ {
-		conn := n.connections[i]
+		state := &n.connections[i]
+		conn := state.conn
 
-		switch n.ping_sent[i].ping_sent {
+		switch state.ping.ping_sent {
 		case 0:
-			if _, err := fmt.Fprintf(*conn, "PING\n"); err != nil {
-				log.Printf("Error sending PING to node %s: %v", (*conn).RemoteAddr(), err)
+			if _, err := fmt.Fprintf(conn, "PING\n"); err != nil {
+				log.Printf("Error sending PING to node %s: %v", conn.RemoteAddr(), err)
 				continue
 			}
-			n.ping_sent[i].ping_sent = 1
-			n.ping_sent[i].deadline = time.Now().Add(pingTimeout)
+			state.ping.ping_sent = 1
+			state.ping.deadline = time.Now().Add(pingTimeout)
 
 		case 1:
-			check_for_pong := ReadWithDeadline(conn)
+			check_for_pong := ReadWithDeadline(state)
 
 			if check_for_pong == "PONG" {
-				log.Printf("RECEIVED PONG FROM: %s", (*conn).RemoteAddr())
-				n.ping_sent[i] = ping_status{}
-			} else if time.Now().After(n.ping_sent[i].deadline) {
-				log.Printf("FAILING NODE: %s", (*conn).RemoteAddr())
+				log.Printf("RECEIVED PONG FROM: %s", conn.RemoteAddr())
+				state.ping = ping_status{}
+			} else if time.Now().After(state.ping.deadline) {
+				log.Printf("FAILING NODE: %s", conn.RemoteAddr())
 			}
 		}
 
 		// This message handling is intentionally unchanged for issue 4.
-		whatever_msg := ReadWithDeadline(conn)
+		whatever_msg := ReadWithDeadline(state)
 		if whatever_msg == "PING" {
-			if _, err := fmt.Fprintf(*conn, "PONG\n"); err != nil {
-				log.Printf("ERROR IN ACCOUNTING FOR PING FOR: %s", (*conn).LocalAddr())
+			if _, err := fmt.Fprintf(conn, "PONG\n"); err != nil {
+				log.Printf("ERROR IN ACCOUNTING FOR PING FOR: %s", conn.LocalAddr())
 			}
 		}
 	}
@@ -303,8 +302,11 @@ func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 					log.Println("Error in accepting new inbound client:", err)
 				}
 			} else {
-				node.connections = append(node.connections, &new_inbound_client)
-				node.ping_sent = append(node.ping_sent, ping_status{})
+				node.connections = append(node.connections, ConnectionState{
+					ping:        ping_status{},
+					conn_reader: *bufio.NewReader(new_inbound_client),
+					conn:        new_inbound_client,
+				})
 			}
 		}
 
