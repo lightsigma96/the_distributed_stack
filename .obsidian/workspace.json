@@ -47,8 +47,7 @@
               "title": "Scaling with Kafka"
             }
           }
-        ],
-        "currentTab": 1
+        ]
       }
     ],
     "direction": "vertical"
@@ -110,8 +109,7 @@
       }
     ],
     "direction": "horizontal",
-    "width": 300,
-    "collapsed": true
+    "width": 300
   },
   "right": {
     "id": "4484e5f7b538f50b",
@@ -214,14 +212,14 @@
       "obsidian-excalidraw-plugin:New drawing": false
     }
   },
-  "active": "4cd4af6eccb4d77f",
+  "active": "4cda998c7ef628ba",
   "lastOpenFiles": [
+    "notes/Excalidraw/Drawing 2026-09-18 16.35.33.excalidraw.md",
+    "notes/Scaling with Kafka.md",
+    "cmds.md",
     "server/server.go~",
     "server/cli-tool.py~",
-    "notes/Excalidraw/Drawing 2026-09-18 16.35.33.excalidraw.md",
     "server/4913",
-    "cmds.md",
-    "notes/Scaling with Kafka.md",
     "notes/Baseline System.md",
     "camera/camera_feed.go~",
     "run_tds_tmux.sh~",
