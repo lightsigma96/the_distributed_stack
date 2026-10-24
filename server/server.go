@@ -301,8 +301,17 @@ func ingestion(states *ClusterCronStates) {
 	cameraConn := states.camera_conn
 	buf := make([]byte, 1024)
 
+	// Do not let an idle camera socket stall cluster health checks forever.
+	if err := cameraConn.SetReadDeadline(time.Now().Add(10 * time.Millisecond)); err != nil {
+		log.Println("could not set camera read deadline:", err)
+		return
+	}
 	n, _, err := cameraConn.ReadFromUDP(buf)
 	if err != nil {
+		var timeoutErr net.Error
+		if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+			return
+		}
 		log.Println("error receiving packet:", err)
 		return
 	}
