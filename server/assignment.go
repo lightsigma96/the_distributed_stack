@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -102,7 +103,7 @@ func serveAssignment(listener net.Listener, node *ClusterNode, localCameraAddres
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			if strings.Contains(strings.ToLower(err.Error()), "closed network connection") {
+			if errors.Is(err, net.ErrClosed) {
 				return
 			}
 			log.Printf("Error accepting camera assignment request: %v", err)
