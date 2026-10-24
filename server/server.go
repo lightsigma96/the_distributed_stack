@@ -510,7 +510,8 @@ func deriveCameraAddress(advertisedAddress, controlAddress string, cameraPort in
 }
 
 func main() {
-	listeningAddr := flag.String("server_address", "nil", "TCP address used for cluster control")
+	listeningAddr := flag.String("server_address", "nil", "Advertised TCP address used for cluster control")
+	bindAddr := flag.String("listen_addr", "", "Local TCP bind address (defaults to -server_address)")
 	cameraPort := flag.Int("cam_addr", 0, "UDP port on which this server receives camera traffic")
 	cameraAddressFlag := flag.String("camera_address", "", "advertised UDP address for cameras (defaults to host in -server_address plus -cam_addr)")
 	assignmentListenAddr := flag.String("assign_listen_addr", "", "TCP address for camera assignment requests")
@@ -525,9 +526,13 @@ func main() {
 		log.Fatal(err)
 	}
 
-	addr, err := net.ResolveTCPAddr("tcp4", *listeningAddr)
+	clusterBindAddress := *bindAddr
+	if clusterBindAddress == "" {
+		clusterBindAddress = *listeningAddr
+	}
+	addr, err := net.ResolveTCPAddr("tcp4", clusterBindAddress)
 	if err != nil {
-		log.Fatal("Unable to resolve server address:", err)
+		log.Fatal("Unable to resolve cluster bind address:", err)
 	}
 
 	listenConn, err := net.ListenTCP("tcp4", addr)
