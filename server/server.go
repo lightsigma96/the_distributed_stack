@@ -9,14 +9,19 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lightsigma96/the_distributed_stack/types"
 	"github.com/segmentio/kafka-go"
 )
 
-const pingTimeout = time.Second
+const (
+	pingTimeout             = time.Second
+	cameraInactivityTimeout = 5 * time.Second
+)
 
 type ping_status struct {
 	ping_sent int
@@ -24,18 +29,27 @@ type ping_status struct {
 }
 
 type ConnectionState struct {
-	ping        ping_status
-	conn_reader bufio.Reader
-	conn        net.Conn
-	node_addr   string
+	ping                ping_status
+	conn_reader         bufio.Reader
+	conn                net.Conn
+	node_addr           string
+	camera_addr         string
+	healthy             bool
+	remote_camera_count int
 }
 
 // cluster node
 type ClusterNode struct {
-	// connections
+	// mu protects the connection list and all mutable ConnectionState fields.
+	mu sync.RWMutex
+
 	connections []ConnectionState
 
-	// listener for cluster
+	// Addresses advertised to other nodes and cameras.
+	control_addr string
+	camera_addr  string
+
+	// listener for cluster control connections
 	listening_conn *net.TCPListener
 }
 
@@ -44,91 +58,223 @@ type ClusterCronStates struct {
 	camera_conn       *net.UDPConn
 	kafka_conns       []*kafka.Conn
 	current_partition int
+
+	cameraMu       sync.Mutex
+	cameraLastSeen map[string]time.Time
+}
+
+func (s *ClusterCronStates) noteCamera(address string) {
+	if address == "" {
+		return
+	}
+
+	s.cameraMu.Lock()
+	s.cameraLastSeen[address] = time.Now()
+	s.cameraMu.Unlock()
+}
+
+// activeCameraCount returns the number of camera endpoints seen within the
+// inactivity window. It is an estimate, not a reservation or hard capacity.
+func (s *ClusterCronStates) activeCameraCount() int {
+	now := time.Now()
+
+	s.cameraMu.Lock()
+	defer s.cameraMu.Unlock()
+
+	for address, lastSeen := range s.cameraLastSeen {
+		if now.Sub(lastSeen) > cameraInactivityTimeout {
+			delete(s.cameraLastSeen, address)
+		}
+	}
+
+	return len(s.cameraLastSeen)
+}
+
+func validHostPort(address string) bool {
+	_, _, err := net.SplitHostPort(address)
+	return err == nil
 }
 
 /*
-	Cluster initialization functions
-*/
+Cluster configuration uses one peer per line:
 
-/*
-Fills out_bound_connections
+control-address|camera-udp-address
 
-Request format is:
-
-1st node addr\r\n
-2nd node addr\r\n
-...
-\r\n\r\n
+Each node initiates a TCP connection only to peers whose control address sorts
+after its own. The PEER handshake lets the receiving node identify the peer.
 */
 func parse_cli_req(req []byte, node *ClusterNode) bool {
-	lines := strings.Split(string(req), "\r\n")
+	lines := strings.Split(string(req), "\n")
 
-	for _, line := range lines[:] {
-		if line == "" {
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || line == "END" {
 			break
 		}
 
-		// TODO(Me): return false when line is wrong
+		parts := strings.SplitN(line, "|", 2)
+		if len(parts) != 2 {
+			log.Printf("Invalid peer entry %q; expected control-address|camera-address", line)
+			return false
+		}
 
-		conn, err := net.Dial("tcp4", line)
-
-		if err != nil {
-			log.Println("Error Adding Outbound Connection:", err)
+		controlAddr := strings.TrimSpace(parts[0])
+		cameraAddr := strings.TrimSpace(parts[1])
+		if !validHostPort(controlAddr) || !validHostPort(cameraAddr) {
+			log.Printf("Invalid peer address in entry %q", line)
+			return false
+		}
+		if controlAddr == node.control_addr {
+			log.Printf("Ignoring self entry %q", line)
 			continue
 		}
 
-		// in bound should have listen and outbound dial
+		// One full-duplex connection per pair: the lexicographically lower
+		// control address initiates the connection.
+		if node.control_addr >= controlAddr {
+			continue
+		}
 
-		node.connections = append(node.connections, ConnectionState{ping_status{}, *bufio.NewReader(conn), conn, line})
+		conn, err := net.DialTimeout("tcp4", controlAddr, time.Second)
+		if err != nil {
+			log.Printf("Error adding outbound connection to %s: %v", controlAddr, err)
+			continue
+		}
+
+		if _, err := fmt.Fprintf(conn, "PEER %s|%s\n", node.control_addr, node.camera_addr); err != nil {
+			log.Printf("Error introducing this node to %s: %v", controlAddr, err)
+			conn.Close()
+			continue
+		}
+
+		state := ConnectionState{
+			ping:                ping_status{},
+			conn_reader:         *bufio.NewReader(conn),
+			conn:                conn,
+			node_addr:           controlAddr,
+			camera_addr:         cameraAddr,
+			remote_camera_count: 0,
+		}
+		node.mu.Lock()
+		node.connections = append(node.connections, state)
+		node.mu.Unlock()
 	}
+
 	return true
 }
 
-/* Waits for correct cli request, sends appropiate message back to cli tool */
+func parsePeerHello(line string) (controlAddr, cameraAddr string, ok bool) {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "PEER ") {
+		return "", "", false
+	}
+
+	parts := strings.SplitN(strings.TrimPrefix(line, "PEER "), "|", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+
+	controlAddr = strings.TrimSpace(parts[0])
+	cameraAddr = strings.TrimSpace(parts[1])
+	if !validHostPort(controlAddr) || !validHostPort(cameraAddr) {
+		return "", "", false
+	}
+
+	return controlAddr, cameraAddr, true
+}
+
+func appendAcceptedPeer(node *ClusterNode, conn net.Conn, reader *bufio.Reader, hello string) bool {
+	controlAddr, cameraAddr, ok := parsePeerHello(hello)
+	if !ok {
+		return false
+	}
+
+	node.mu.Lock()
+	node.connections = append(node.connections, ConnectionState{
+		ping:        ping_status{},
+		conn_reader: *reader,
+		conn:        conn,
+		node_addr:   controlAddr,
+		camera_addr: cameraAddr,
+	})
+	node.mu.Unlock()
+	return true
+}
+
+/*
+Waits for cluster configuration. Incoming node connections may arrive before
+the CLI configuration request, so they are identified by their PEER handshake.
+*/
 func wait_for_clireq(node *ClusterNode) {
 	log.Println("\nWAITING FOR CLI TOOL TO SPECIFY CLUSTER")
 
 	for {
-		cli_req, err := node.listening_conn.Accept()
+		cliReq, err := node.listening_conn.Accept()
 		if err != nil {
-			log.Println("Error accepting CLI connection:", err)
+			log.Println("Error accepting cluster connection:", err)
 			continue
 		}
 
-		cli_msg := make([]byte, 1024)
-		n, err := cli_req.Read(cli_msg) // TODO(AI): loop for complete message
+		_ = cliReq.SetDeadline(time.Now().Add(2 * time.Second))
+		reader := bufio.NewReader(cliReq)
+		firstLine, err := reader.ReadString('\n')
 		if err != nil {
-			log.Println("Error reading CLI request:", err)
-			cli_req.Close()
+			log.Println("Error reading initial cluster message:", err)
+			cliReq.Close()
 			continue
 		}
 
-		if parse_cli_req(cli_msg[:n], node) {
-			response_to_cli := "\nOK FORMED A CLUSTER"
-			//if _, err := cli_req.Write([]byte(response_to_cli)); err != nil {
-			//	log.Println("Error sending response to cli:", err)
-			//}
-			log.Println(response_to_cli)
-			cli_req.Close()
-			return
+		if strings.HasPrefix(strings.TrimSpace(firstLine), "PEER ") {
+			if !appendAcceptedPeer(node, cliReq, reader, firstLine) {
+				log.Printf("Invalid peer handshake from %s", cliReq.RemoteAddr())
+				cliReq.Close()
+				continue
+			}
+			_ = cliReq.SetDeadline(time.Time{})
+			log.Printf("Accepted peer connection from %s", cliReq.RemoteAddr())
+			continue
 		}
 
-		response_to_cli := "\nINVAILD CLI REQUEST"
-		if _, err := cli_req.Write([]byte(response_to_cli)); err != nil {
-			log.Println("Error sending response to cli:", err)
+		if strings.TrimSpace(firstLine) != "CONFIG" {
+			log.Printf("Invalid initial cluster message from %s", cliReq.RemoteAddr())
+			cliReq.Close()
+			continue
 		}
-		log.Println(response_to_cli)
-		cli_req.Close()
+
+		var request strings.Builder
+		for {
+			line, readErr := reader.ReadString('\n')
+			if readErr != nil {
+				log.Println("Error reading CLI cluster request:", readErr)
+				break
+			}
+			if strings.TrimSpace(line) == "END" {
+				if parse_cli_req([]byte(request.String()), node) {
+					response := "OK FORMED A CLUSTER\n"
+					if _, err := fmt.Fprint(cliReq, response); err != nil {
+						log.Println("Error responding to CLI:", err)
+					}
+					log.Print(response)
+					cliReq.Close()
+					return
+				}
+				break
+			}
+			request.WriteString(line)
+		}
+
+		if err := cliReq.Close(); err != nil {
+			log.Println("Error closing CLI connection:", err)
+		}
 	}
 }
 
-/* pushses a event into kafka partition */
-
+/* pushes an event into a Kafka partition */
 func produce_event(conn *kafka.Conn, event types.Packet) {
 	var send_event []byte
-	id_slice := make([]byte, 8)
-	binary.BigEndian.PutUint64(id_slice, event.CameraID)
-	send_event = append(send_event, id_slice...)
+	idSlice := make([]byte, 8)
+	binary.BigEndian.PutUint64(idSlice, event.CameraID)
+	send_event = append(send_event, idSlice...)
 
 	send_event = binary.BigEndian.AppendUint32(
 		send_event,
@@ -142,77 +288,66 @@ func produce_event(conn *kafka.Conn, event types.Packet) {
 	)
 	send_event = append(send_event, event.Data[:]...)
 
-	_, err := conn.WriteMessages(
-		kafka.Message{
-			Value: send_event,
-		},
-	)
-
+	_, err := conn.WriteMessages(kafka.Message{Value: send_event})
 	if err != nil {
 		log.Printf("Error queuing packet: %v", err)
 	}
 }
 
 /*
-Takes feed from cctv and push events into kafka
+Takes feed from cameras and pushes events into Kafka.
 */
-func ingestion(camera_conn *net.UDPConn, kafka_conns []*kafka.Conn, current_partition *int) {
+func ingestion(states *ClusterCronStates) {
+	cameraConn := states.camera_conn
 	buf := make([]byte, 1024)
 
-	n, _, err := camera_conn.ReadFromUDP(buf)
+	n, _, err := cameraConn.ReadFromUDP(buf)
 	if err != nil {
 		log.Println("error receiving packet:", err)
 		return
 	}
 
 	raw := buf[:n]
-
 	if len(raw) < 12 {
 		log.Println("packet too small")
 		return
 	}
 
-	var p types.Packet
-	p.CameraID = binary.BigEndian.Uint64(raw[0:8])
+	var packet types.Packet
+	packet.CameraID = binary.BigEndian.Uint64(raw[0:8])
 
 	addressLen := int(binary.BigEndian.Uint32(raw[8:12]))
 	addressStart := 12
 	addressEnd := addressStart + addressLen
-
-	if addressEnd+4 > len(raw) {
+	if addressLen < 0 || addressEnd+4 > len(raw) {
 		log.Println("invalid address length")
 		return
 	}
 
-	p.CameraAddress = string(raw[addressStart:addressEnd])
+	packet.CameraAddress = string(raw[addressStart:addressEnd])
 
-	dataLen := int(binary.BigEndian.Uint32(
-		raw[addressEnd : addressEnd+4],
-	))
+	dataLen := int(binary.BigEndian.Uint32(raw[addressEnd : addressEnd+4]))
 	dataStart := addressEnd + 4
 	dataEnd := dataStart + dataLen
-
-	if dataEnd > len(raw) || dataLen > len(p.Data) {
+	if dataEnd > len(raw) || dataLen > len(packet.Data) {
 		log.Println("invalid data length")
 		return
 	}
 
-	copy(p.Data[:], raw[dataStart:dataEnd])
-	fmt.Printf("Partition: %d\n", *current_partition)
+	copy(packet.Data[:], raw[dataStart:dataEnd])
+	states.noteCamera(packet.CameraAddress)
 
-	produce_event(
-		kafka_conns[*current_partition],
-		p,
-	)
+	partition := states.current_partition
+	fmt.Printf("Partition: %d\n", partition)
+	produce_event(states.kafka_conns[partition], packet)
 
-	*current_partition++
-
-	if *current_partition >= types.MAX_PARTITION {
-		*current_partition = 0
+	states.current_partition++
+	if states.current_partition >= types.MAX_PARTITION {
+		states.current_partition = 0
 	}
 }
 
-/* Reads with a particular deadline, purpose is that reads should not be blocking, handles errors internally */
+/* Reads with a deadline so health checks don't block indefinitely. */
 func ReadWithDeadline(state *ConnectionState) string {
 	if err := state.conn.SetReadDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
 		log.Println("Couldn't set read deadline:", err)
@@ -229,7 +364,6 @@ func ReadWithDeadline(state *ConnectionState) string {
 	if err != nil {
 		var timeoutErr net.Error
 		if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
-			log.Println("Read timed out")
 			return ""
 		}
 		if !errors.Is(err, net.ErrClosed) {
@@ -238,145 +372,217 @@ func ReadWithDeadline(state *ConnectionState) string {
 		return ""
 	}
 
-	return strings.TrimSuffix(strings.TrimSuffix(message, "\n"), "\r")
+	return strings.TrimSpace(message)
+}
+
+func reportedCameraCount(message, command string) (int, bool) {
+	fields := strings.Fields(message)
+	if len(fields) != 2 || fields[0] != command {
+		return 0, false
+	}
+
+	count, err := strconv.Atoi(fields[1])
+	if err != nil || count < 0 {
+		return 0, false
+	}
+	return count, true
 }
 
 /*
-on-wire format of PING : "PING\n" & same for PONG
-
-returns addr of node which did not respond pong
-
-NOTE : PING and PONG are both followed by \n as there might be other messsages, hence having \n delimiter
+PING and PONG carry each node's recently active camera count. The count is
+best-effort cluster state; it is not a capacity reservation.
 */
-func check_health(n *ClusterNode) {
-	/* Be self-centered, just do your task */
+func check_health(node *ClusterNode, localCameraCount int) {
+	node.mu.Lock()
+	defer node.mu.Unlock()
 
-	for i := 0; i < len(n.connections); i++ {
-		state := &n.connections[i]
-		conn := state.conn
+	for i := range node.connections {
+		state := &node.connections[i]
+		if state.conn == nil {
+			continue
+		}
 
 		switch state.ping.ping_sent {
 		case 0:
-			if _, err := fmt.Fprintf(conn, "PING\n"); err != nil {
+			if _, err := fmt.Fprintf(state.conn, "PING %d\n", localCameraCount); err != nil {
 				log.Printf("Error sending PING to node %s: %v", state.node_addr, err)
+				state.healthy = false
+				state.ping = ping_status{}
 				continue
 			}
 			state.ping.ping_sent = 1
 			state.ping.deadline = time.Now().Add(pingTimeout)
 
 		case 1:
-			node_msg := ReadWithDeadline(state)
-
-			if !time.Now().After(state.ping.deadline) {
-				if node_msg == "PONG" {
-					log.Printf("RECEIVED PONG FROM: %s", state.node_addr)
-					state.ping = ping_status{}
-				} else {
-					if node_msg == "PING" {
-						if _, err := fmt.Fprintf(conn, "PONG\n"); err != nil {
-							log.Printf("ERROR IN ACCOUNTING FOR PING FOR: %s", state.node_addr)
-						}
+			message := ReadWithDeadline(state)
+			if message != "" {
+				fields := strings.Fields(message)
+				switch {
+				case len(fields) >= 1 && fields[0] == "PING":
+					if count, ok := reportedCameraCount(message, "PING"); ok {
+						state.remote_camera_count = count
 					}
-					// handle whatever the msg is
+					state.healthy = true
+					if _, err := fmt.Fprintf(state.conn, "PONG %d\n", localCameraCount); err != nil {
+						log.Printf("Error responding to PING from %s: %v", state.node_addr, err)
+						state.healthy = false
+					}
+
+				case len(fields) >= 1 && fields[0] == "PONG":
+					if count, ok := reportedCameraCount(message, "PONG"); ok {
+						state.remote_camera_count = count
+					}
+					state.healthy = true
+					state.ping = ping_status{}
 				}
-			} else {
-				log.Printf("FAILING NODE: %s", state.node_addr)
+			}
+
+			if state.ping.ping_sent == 1 && time.Now().After(state.ping.deadline) {
+				log.Printf("Peer health check timed out: %s", state.node_addr)
+				state.healthy = false
+				state.ping = ping_status{}
 			}
 		}
 	}
 }
 
-/* Sleeps for 100ms after every iteration. This is the main loop for this server (add go routine to ping to make it concurrent) */
+/* Main loop for this server. */
 func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 	for {
-		// accept incoming connections (10ms deadline)
-		err := node.listening_conn.SetDeadline(time.Now().Add(time.Millisecond * 10))
+		// Accept node-to-node connections. Each accepted connection must begin
+		// with a PEER handshake before being treated as a cluster connection.
+		err := node.listening_conn.SetDeadline(time.Now().Add(10 * time.Millisecond))
 		if err != nil {
 			log.Println("Couldn't set deadline on listening socket:", err)
 		} else {
-			new_inbound_client, err := node.listening_conn.Accept()
-
-			if err != nil {
+			newInbound, acceptErr := node.listening_conn.Accept()
+			if acceptErr != nil {
 				var timeoutErr net.Error
-				if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
-					log.Println("No new connection to accept")
+				if errors.As(acceptErr, &timeoutErr) && timeoutErr.Timeout() {
+					// No new connection during this iteration.
 				} else {
-					log.Println("Error in accepting new inbound client:", err)
+					log.Println("Error accepting new inbound client:", acceptErr)
 				}
 			} else {
-				node.connections = append(node.connections, ConnectionState{
-					ping:        ping_status{},
-					conn_reader: *bufio.NewReader(new_inbound_client),
-					conn:        new_inbound_client,
-				})
+				_ = newInbound.SetDeadline(time.Now().Add(time.Second))
+				reader := bufio.NewReader(newInbound)
+				hello, readErr := reader.ReadString('\n')
+				if readErr != nil || !appendAcceptedPeer(node, newInbound, reader, hello) {
+					log.Printf("Rejecting connection without a valid PEER handshake from %s", newInbound.RemoteAddr())
+					newInbound.Close()
+				} else {
+					_ = newInbound.SetDeadline(time.Time{})
+				}
 			}
 		}
 
-		// send new events (TODO (me): how much time does this func takes in ms)
-		ingestion(states.camera_conn, states.kafka_conns, &states.current_partition)
-
-		// Check Health
-		check_health(node)
-
-		time.Sleep(time.Millisecond * 100)
+		ingestion(states)
+		check_health(node, states.activeCameraCount())
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
+func deriveCameraAddress(advertisedAddress, controlAddress string, cameraPort int) (string, error) {
+	if advertisedAddress != "" {
+		if !validHostPort(advertisedAddress) {
+			return "", fmt.Errorf("invalid -camera_address %q; expected host:port", advertisedAddress)
+		}
+		return advertisedAddress, nil
+	}
+
+	host, _, err := net.SplitHostPort(controlAddress)
+	if err != nil {
+		return "", fmt.Errorf("cannot derive camera address from -server_address: %w", err)
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return "", fmt.Errorf("set -camera_address when -server_address binds to a wildcard address")
+	}
+	return net.JoinHostPort(host, strconv.Itoa(cameraPort)), nil
+}
+
 func main() {
-	listening_addr := flag.String("server_address", "nil", "Specify address of server to start on")
-	cameras_addr := flag.Int("cam_addr", 0, "Specify address of camera to listen on")
+	listeningAddr := flag.String("server_address", "nil", "TCP address used for cluster control")
+	cameraPort := flag.Int("cam_addr", 0, "UDP port on which this server receives camera traffic")
+	cameraAddressFlag := flag.String("camera_address", "", "advertised UDP address for cameras (defaults to host in -server_address plus -cam_addr)")
+	assignmentListenAddr := flag.String("assign_listen_addr", "", "TCP address for camera assignment requests")
 	flag.Parse()
 
-	addr, err := net.ResolveTCPAddr("tcp4", *listening_addr)
+	if *cameraPort < 1 || *cameraPort > 65535 {
+		log.Fatal("-cam_addr must be a TCP/UDP port in the range 1..65535")
+	}
+
+	cameraAddress, err := deriveCameraAddress(*cameraAddressFlag, *listeningAddr, *cameraPort)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	addr, err := net.ResolveTCPAddr("tcp4", *listeningAddr)
 	if err != nil {
 		log.Fatal("Unable to resolve server address:", err)
 	}
 
-	listen_conn, err := net.ListenTCP("tcp4", addr)
+	listenConn, err := net.ListenTCP("tcp4", addr)
 	if err != nil {
-		log.Fatal("Unable to listen for cli tool:", err)
+		log.Fatal("Unable to listen for cluster connections:", err)
 	}
 
-	var node ClusterNode
-	var cluster_state ClusterCronStates
-	node.listening_conn = listen_conn
+	node := ClusterNode{
+		listening_conn: listenConn,
+		control_addr:   *listeningAddr,
+		camera_addr:    cameraAddress,
+	}
+	clusterState := ClusterCronStates{
+		cameraLastSeen: make(map[string]time.Time),
+	}
 
-	// become a part of cluster
 	wait_for_clireq(&node)
 
-	// Form connection with cameras
-	const topic = "camera-topic"
-	cam_conn, err := net.ListenUDP("udp4", &net.UDPAddr{
-		Port: *cameras_addr,
-	})
+	// Listen for camera data on UDP.
+	cameraConn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: *cameraPort})
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer cam_conn.Close()
+	defer cameraConn.Close()
 
-	// Form connection with kafka
-	kafka_conns := make([]*kafka.Conn, types.MAX_PARTITION)
+	// Connect to Kafka partitions.
+	const topic = "camera-topic"
+	kafkaConns := make([]*kafka.Conn, types.MAX_PARTITION)
 	for partition := 0; partition < types.MAX_PARTITION; partition++ {
-		kafka_conn, err := kafka.DialLeader(
+		kafkaConn, dialErr := kafka.DialLeader(
 			context.Background(),
 			"tcp",
 			"localhost:9092",
 			topic,
 			partition,
 		)
-		if err != nil {
-			log.Fatalf("failed to connect to partition %d: %v", partition, err)
+		if dialErr != nil {
+			log.Fatalf("failed to connect to partition %d: %v", partition, dialErr)
 		}
-		kafka_conns[partition] = kafka_conn
+		kafkaConns[partition] = kafkaConn
 	}
 	defer func() {
-		for _, kafka_conn := range kafka_conns {
-			kafka_conn.Close()
+		for _, kafkaConn := range kafkaConns {
+			_ = kafkaConn.Close()
 		}
 	}()
 
-	cluster_state.camera_conn = cam_conn
-	cluster_state.kafka_conns = kafka_conns
-	cluster_state.current_partition = 0
-	clusterCron(&node, &cluster_state)
+	clusterState.camera_conn = cameraConn
+	clusterState.kafka_conns = kafkaConns
+	clusterState.current_partition = 0
+
+	if *assignmentListenAddr != "" {
+		assignmentTCPAddr, resolveErr := net.ResolveTCPAddr("tcp4", *assignmentListenAddr)
+		if resolveErr != nil {
+			log.Fatal("Unable to resolve assignment listener address:", resolveErr)
+		}
+		assignmentListener, listenErr := net.ListenTCP("tcp4", assignmentTCPAddr)
+		if listenErr != nil {
+			log.Fatal("Unable to listen for camera assignments:", listenErr)
+		}
+		defer assignmentListener.Close()
+		go serveAssignment(assignmentListener, &node, cameraAddress, &clusterState)
+		log.Printf("Camera assignment service listening on %s; advertises %s", *assignmentListenAddr, cameraAddress)
+	}
+
+	clusterCron(&node, &clusterState)
 }
