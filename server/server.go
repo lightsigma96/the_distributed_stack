@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/rpc"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/lightsigma96/the_distributed_stack/types"
@@ -45,7 +47,7 @@ type ClusterCronStates struct {
 	kafka_conns       []*kafka.Conn
 	current_partition int
 
-	camera_count     int
+	camera_count     atomic.Int64
 	camera_addresses map[string]struct{}
 }
 
@@ -65,13 +67,53 @@ func (s *ClusterCronStates) record_camera(address string) {
 	}
 
 	s.camera_addresses[address] = struct{}{}
-	s.camera_count++
+	s.camera_count.Add(1)
 }
 
 // ReportCameraCount returns the number of distinct camera endpoints this
 // server has observed since startup.
 func (s *ClusterCronStates) ReportCameraCount() int {
-	return s.camera_count
+	return int(s.camera_count.Load())
+}
+
+// GetCameraCount is exposed over net/rpc as CameraStats.GetCameraCount.
+func (s *ClusterCronStates) GetCameraCount(_ int, reply *int) error {
+	*reply = s.ReportCameraCount()
+	return nil
+}
+
+// startRPC serves camera-count RPC on its own TCP listener, separate from the
+// cluster-control listener. Each RPC connection is served independently.
+func startRPC(addr string, stats *ClusterCronStates) (net.Listener, error) {
+	server := rpc.NewServer()
+	if err := server.RegisterName("CameraStats", stats); err != nil {
+		return nil, err
+	}
+
+	listener, err := net.Listen("tcp4", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				log.Println("RPC accept error:", err)
+				continue
+			}
+
+			go func() {
+				defer conn.Close()
+				server.ServeConn(conn)
+			}()
+		}
+	}()
+
+	return listener, nil
 }
 
 /*
@@ -354,6 +396,7 @@ func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 func main() {
 	listening_addr := flag.String("server_address", "nil", "Specify address of server to start on")
 	cameras_addr := flag.Int("cam_addr", 0, "Specify address of camera to listen on")
+	rpc_addr := flag.String("rpc_addr", "", "TCP address for camera-count RPC")
 	flag.Parse()
 
 	addr, err := net.ResolveTCPAddr("tcp4", *listening_addr)
@@ -407,5 +450,15 @@ func main() {
 	cluster_state.camera_conn = cam_conn
 	cluster_state.kafka_conns = kafka_conns
 	cluster_state.current_partition = 0
+
+	if *rpc_addr != "" {
+		rpc_listener, err := startRPC(*rpc_addr, &cluster_state)
+		if err != nil {
+			log.Fatal("Unable to start camera-count RPC:", err)
+		}
+		defer rpc_listener.Close()
+		log.Println("Camera-count RPC listening on", *rpc_addr)
+	}
+
 	clusterCron(&node, &cluster_state)
 }
