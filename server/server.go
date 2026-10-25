@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/rpc"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/lightsigma96/the_distributed_stack/types"
@@ -44,6 +46,71 @@ type ClusterCronStates struct {
 	camera_conn       *net.UDPConn
 	kafka_conns       []*kafka.Conn
 	current_partition int
+
+	camera_count     atomic.Int64
+	camera_addresses map[string]struct{}
+}
+
+// record_camera records each UDP source endpoint once.
+func (s *ClusterCronStates) record_camera(address string) {
+	if address == "" {
+		return
+	}
+
+	if s.camera_addresses == nil {
+		s.camera_addresses = make(map[string]struct{})
+	}
+	if _, exists := s.camera_addresses[address]; exists {
+		return
+	}
+
+	s.camera_addresses[address] = struct{}{}
+	s.camera_count.Add(1)
+}
+
+// ReportCameraCount returns the number of distinct camera endpoints observed
+// since this server started.
+func (s *ClusterCronStates) ReportCameraCount() int {
+	return int(s.camera_count.Load())
+}
+
+// GetCameraCount exposes the camera count through net/rpc.
+func (s *ClusterCronStates) GetCameraCount(_ int, reply *int) error {
+	*reply = s.ReportCameraCount()
+	return nil
+}
+
+// startRPC starts a dedicated TCP listener for camera-count RPCs.
+func startRPC(addr string, stats *ClusterCronStates) (net.Listener, error) {
+	server := rpc.NewServer()
+	if err := server.RegisterName("CameraStats", stats); err != nil {
+		return nil, err
+	}
+
+	listener, err := net.Listen("tcp4", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				log.Println("RPC accept error:", err)
+				continue
+			}
+
+			go func(conn net.Conn) {
+				defer conn.Close()
+				server.ServeConn(conn)
+			}(conn)
+		}
+	}()
+
+	return listener, nil
 }
 
 /*
@@ -156,10 +223,10 @@ func produce_event(conn *kafka.Conn, event types.Packet) {
 /*
 Takes feed from cctv and push events into kafka
 */
-func ingestion(camera_conn *net.UDPConn, kafka_conns []*kafka.Conn, current_partition *int) {
+func ingestion(camera_conn *net.UDPConn, kafka_conns []*kafka.Conn, current_partition *int, states *ClusterCronStates) {
 	buf := make([]byte, 1024)
 
-	n, _, err := camera_conn.ReadFromUDP(buf)
+	n, camera_addr, err := camera_conn.ReadFromUDP(buf)
 	if err != nil {
 		log.Println("error receiving packet:", err)
 		return
@@ -198,6 +265,7 @@ func ingestion(camera_conn *net.UDPConn, kafka_conns []*kafka.Conn, current_part
 	}
 
 	copy(p.Data[:], raw[dataStart:dataEnd])
+	states.record_camera(camera_addr.String())
 	fmt.Printf("Partition: %d\n", *current_partition)
 
 	produce_event(
@@ -313,7 +381,7 @@ func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 		}
 
 		// send new events (TODO (me): how much time does this func takes in ms)
-		ingestion(states.camera_conn, states.kafka_conns, &states.current_partition)
+		ingestion(states.camera_conn, states.kafka_conns, &states.current_partition, states)
 
 		// Check Health
 		check_health(node)
@@ -325,6 +393,7 @@ func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 func main() {
 	listening_addr := flag.String("server_address", "nil", "Specify address of server to start on")
 	cameras_addr := flag.Int("cam_addr", 0, "Specify address of camera to listen on")
+	rpc_addr := flag.String("rpc_addr", "", "TCP address for camera-count RPC")
 	flag.Parse()
 
 	addr, err := net.ResolveTCPAddr("tcp4", *listening_addr)
@@ -378,5 +447,15 @@ func main() {
 	cluster_state.camera_conn = cam_conn
 	cluster_state.kafka_conns = kafka_conns
 	cluster_state.current_partition = 0
+
+	if *rpc_addr != "" {
+		rpc_listener, err := startRPC(*rpc_addr, &cluster_state)
+		if err != nil {
+			log.Fatal("Unable to start camera-count RPC:", err)
+		}
+		defer rpc_listener.Close()
+		log.Println("Camera-count RPC listening on", *rpc_addr)
+	}
+
 	clusterCron(&node, &cluster_state)
 }
