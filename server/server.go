@@ -10,7 +10,6 @@ import (
 	"log"
 	"net"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/lightsigma96/the_distributed_stack/types"
@@ -46,7 +45,6 @@ type ClusterCronStates struct {
 	kafka_conns       []*kafka.Conn
 	current_partition int
 
-	camera_mu        sync.RWMutex
 	camera_count     int
 	camera_addresses map[string]struct{}
 }
@@ -57,9 +55,6 @@ func (s *ClusterCronStates) record_camera(address string) {
 	if address == "" {
 		return
 	}
-
-	s.camera_mu.Lock()
-	defer s.camera_mu.Unlock()
 
 	if s.camera_addresses == nil {
 		s.camera_addresses = make(map[string]struct{})
@@ -76,9 +71,6 @@ func (s *ClusterCronStates) record_camera(address string) {
 // ReportCameraCount returns the number of distinct camera endpoints this
 // server has observed since startup.
 func (s *ClusterCronStates) ReportCameraCount() int {
-	s.camera_mu.RLock()
-	defer s.camera_mu.RUnlock()
-
 	return s.camera_count
 }
 
