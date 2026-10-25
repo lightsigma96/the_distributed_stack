@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lightsigma96/the_distributed_stack/types"
@@ -44,6 +45,41 @@ type ClusterCronStates struct {
 	camera_conn       *net.UDPConn
 	kafka_conns       []*kafka.Conn
 	current_partition int
+
+	camera_mu        sync.RWMutex
+	camera_count     int
+	camera_addresses map[string]struct{}
+}
+
+// record_camera records a camera endpoint once, even though that camera sends
+// many packets. The UDP source address is used as the camera's observed identity.
+func (s *ClusterCronStates) record_camera(address string) {
+	if address == "" {
+		return
+	}
+
+	s.camera_mu.Lock()
+	defer s.camera_mu.Unlock()
+
+	if s.camera_addresses == nil {
+		s.camera_addresses = make(map[string]struct{})
+	}
+
+	if _, exists := s.camera_addresses[address]; exists {
+		return
+	}
+
+	s.camera_addresses[address] = struct{}{}
+	s.camera_count++
+}
+
+// ReportCameraCount returns the number of distinct camera endpoints this
+// server has observed since startup.
+func (s *ClusterCronStates) ReportCameraCount() int {
+	s.camera_mu.RLock()
+	defer s.camera_mu.RUnlock()
+
+	return s.camera_count
 }
 
 /*
@@ -156,10 +192,10 @@ func produce_event(conn *kafka.Conn, event types.Packet) {
 /*
 Takes feed from cctv and push events into kafka
 */
-func ingestion(camera_conn *net.UDPConn, kafka_conns []*kafka.Conn, current_partition *int) {
+func ingestion(camera_conn *net.UDPConn, kafka_conns []*kafka.Conn, current_partition *int, states *ClusterCronStates) {
 	buf := make([]byte, 1024)
 
-	n, _, err := camera_conn.ReadFromUDP(buf)
+	n, camera_addr, err := camera_conn.ReadFromUDP(buf)
 	if err != nil {
 		log.Println("error receiving packet:", err)
 		return
@@ -198,6 +234,7 @@ func ingestion(camera_conn *net.UDPConn, kafka_conns []*kafka.Conn, current_part
 	}
 
 	copy(p.Data[:], raw[dataStart:dataEnd])
+	states.record_camera(camera_addr.String())
 	fmt.Printf("Partition: %d\n", *current_partition)
 
 	produce_event(
@@ -313,7 +350,7 @@ func clusterCron(node *ClusterNode, states *ClusterCronStates) {
 		}
 
 		// send new events (TODO (me): how much time does this func takes in ms)
-		ingestion(states.camera_conn, states.kafka_conns, &states.current_partition)
+		ingestion(states.camera_conn, states.kafka_conns, &states.current_partition, states)
 
 		// Check Health
 		check_health(node)
